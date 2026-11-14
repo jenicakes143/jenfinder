@@ -1,0 +1,3186 @@
+-- Jen Finder
+local Players = game:GetService('Players')
+local RS = game:GetService('ReplicatedStorage')
+local player = Players.LocalPlayer
+assert(player, 'Join the game first')
+local parent = player:WaitForChild('PlayerGui', 15)
+assert(parent, 'PlayerGui unavailable')
+local old = parent:FindFirstChild('TENSHI_FINDER_TOP4_PREVIEW')
+if old then
+   old:Destroy()
+end
+local gui = Instance.new('ScreenGui')
+gui.Name = 'TENSHI_FINDER_TOP4_PREVIEW'
+gui:SetAttribute('TenshiUIBuild','PUBLIC-CONTABO')
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+pcall(function() gui.ScreenInsets = Enum.ScreenInsets.None end)
+pcall(function() gui.ClipToDeviceSafeArea = false end)
+gui.DisplayOrder = 1200
+gui.Parent = parent
+local alive = true
+local highlight
+gui.Destroying:Connect(function() alive = false;
+ if highlight then highlight:Destroy() end
+end)
+local function make(class, props, holder)
+  local obj = Instance.new(class)
+  for key, value in pairs(props) do obj[key] = value end
+  obj.Parent = holder
+  return obj
+end
+local function label(holder, text, pos, size, color, fontSize)
+  return make('TextLabel', {Text=text,Position=pos,Size=size,BackgroundTransparency=1,TextColor3=color or Color3.new(1,1,1),Font=Enum.Font.GothamBold,TextSize=fontSize or 13,TextXAlignment=Enum.TextXAlignment.Left,TextTruncate=Enum.TextTruncate.AtEnd},holder)
+end
+local function module(path)
+  local obj = RS
+  for part in path:gmatch('[^.]+') do
+    obj = obj:FindFirstChild(part)
+    assert(obj, 'Missing game module: '..path)
+  end
+  return require(obj)
+end
+local function numberField(record, keys)
+  for _, key in ipairs(keys) do
+    local value = record and record[key]
+    if type(value)=='number' and value==value and math.abs(value)<math.huge then
+       return value
+    end
+  end
+end
+local function modelFor(uid)
+  if type(uid)~='string' then return end
+  local folder = workspace:FindFirstChild('AreaEggSlotsClient')
+  local obj = (folder and folder:FindFirstChild(uid)) or workspace:FindFirstChild(uid)
+  if obj and obj:IsA('Model') then return obj end
+end
+local function displayedRate(model)
+  if not model then return end
+  for _,obj in ipairs(model:GetDescendants()) do
+    if obj:IsA('TextLabel') or obj:IsA('TextButton') then
+      local text=obj.Text:gsub('<[^>]+>',''):gsub(',','')
+      local amount,suffix=text:match('%$?%s*(%d+%.?%d*)%s*(%a*)%s*/[sS]')
+      local powers={['']=1,k=1e3,m=1e6,b=1e9,t=1e12,qa=1e15,q=1e15,qi=1e18}
+      local factor=suffix and powers[suffix:lower()]
+      if amount and factor then
+         return tonumber(amount)*factor
+      end
+    end
+  end
+end
+local function money(value)
+  if not value then return 'Income unavailable' end
+  for _,entry in ipairs({{1e18,'Qi'},{1e15,'Qa'},{1e12,'T'},{1e9,'B'},{1e6,'M'},{1e3,'K'}}) do
+    if value>=entry[1] then
+       return string.format('$%.2f%s/s',value/entry[1],entry[2])
+    end
+  end
+  return string.format('$%.2f/s',value)
+end
+local MIN_BROADCAST_RATE = 60000000
+local function valid(value)
+  return type(value)=='number' and value==value and value>=0 and value<math.huge
+end
+local function computedRate(base, scale, muts, mutationModule)
+  if not valid(base) or not valid(scale) or scale==0 then return nil end
+  local multi=1
+  if type(muts)~='table' then return nil end
+  if next(muts) then
+    local fn=mutationModule and mutationModule.EarningsFor
+    if type(fn)~='function' then return nil end
+    local ok,result=pcall(fn,muts)
+    if not ok or not valid(result) then return nil end
+    multi=result
+  end
+  local factor=scale>5 and (scale/5)^1.2*19.637875755794113 or scale^1.85
+  local result=base*factor*multi
+  return valid(result) and result or nil
+end
+local function readTraitNames(record)
+  local names,seen={},{}
+  local known=record.Mutations~=nil or record.BaseMutation~=nil
+  local function add(value)
+    if type(value)=='string' and value~='' and value~='None' and value~='Normal' and not seen[value] then
+       seen[value]=true;
+      names[#names+1]=value
+    end
+  end
+  if type(record.Mutations)=='table' then
+    for key,value in pairs(record.Mutations) do
+      if value==true and type(key)=='string' then add(key)
+      elseif type(value)=='string' then add(value)
+      elseif type(value)=='table' then
+         local id=value.Id or value._id or value.Name;
+         if type(id)=='string' then add(id) else known=false end
+      end
+    end
+  elseif type(record.Mutations)=='string' then
+    for value in record.Mutations:gmatch('[^,;|]+') do
+       add(value:match('^%s*(.-)%s*$'))
+    end
+  end
+  add(record.BaseMutation);
+  table.sort(names)
+  return names,known
+end
+local allowedRarities={cosmic=7,secret=8,eternal=9,ethernal=9,divine=10}
+local excludedEggs={triceratops=true,bronto=true,whaleshark=true,belugawhale=true,lavaccasaturnosaturnita=true}
+local function excludedFinderEgg(name) return excludedEggs[tostring(name):lower():gsub('[^%a%d]','')]==true end
+local function finderRarityRank(rarity) return allowedRarities[tostring(rarity):lower()] end
+local function createFinder(D)
+  local cycleModule
+  pcall(function() cycleModule=module('Shared.Util.AreaEggCycle') end)
+  local function cycleInfo()
+    if not cycleModule then return nil end
+    local ok,info=pcall(function()
+      local now=workspace:GetServerTimeNow()
+      local running=cycleModule.IsRunning()
+      local remaining=cycleModule.SecondsUntilReset(now)
+      local respawnAt
+      if type(cycleModule.PeriodStartTime)=='function' and type(cycleModule.PeriodIndexAt)=='function' then
+        local known,value=pcall(function() return cycleModule.PeriodStartTime(cycleModule.PeriodIndexAt(now))*1000 end)
+        if known and type(value)=='number' then respawnAt=value end
+      end
+      return {resetAt=cycleModule.NextResetTime(now)*1000,respawnAt=respawnAt,remaining=remaining,running=running}
+    end)
+    return ok and info or nil
+  end
+  -- TAKEN entries are hidden entirely from the list.
+  D.publicEntryAllowed=function(entry,now)
+    return type(entry)=='table' and not entry.takenConfirmed and finderRarityRank(entry.rarity)~=nil and not excludedFinderEgg(entry.name) and not excludedFinderEgg(entry.category) and entry.source~='event' and type(entry.expiresAt)=='number' and entry.expiresAt>now
+  end
+  local PREMIUM_EDITION=false
+  local AUTO_KEY=''
+  local originalMake,originalLabel=D.make,D.label
+  D.make=function(class,props,parent)
+    if class=='TextButton' or class=='TextBox' then
+       props.Font=Enum.Font.GothamBold;
+      props.TextSize=math.max(props.TextSize or 15,15)
+    end
+    if class=='TextBox' then props.TextColor3=Color3.fromRGB(25,25,30) end
+    local obj=originalMake(class,props,parent)
+    if class=='TextButton' or class=='TextBox' then
+       originalMake('UICorner',{CornerRadius=UDim.new(0,5)},obj)
+    end
+    return obj
+  end
+  D.label=function(parent,text,pos,size,color,fontSize)
+    local obj=originalLabel(parent,text,pos,size,color or Color3.fromRGB(240,242,255),math.max(fontSize or 15,14))
+    obj.Font=Enum.Font.GothamBold;
+    obj.TextStrokeColor3=Color3.new(0,0,0);
+    obj.TextStrokeTransparency=0.45;
+    return obj
+  end
+  local DISCORD='https://discord.gg/GFZYsspybS'
+  local Http=game:GetService('HttpService')
+  local Teleports=game:GetService('TeleportService')
+  local requestFn=request or http_request or (syn and syn.request) or (http and http.request)
+  local active,othersOnly=true,false
+  local reporterId=Http:GenerateGUID(false)
+  D.reporterStartedAt=DateTime.now().UnixTimestampMillis
+  local config,configAt=nil,-math.huge
+  local feed,feedAt={},0
+  local clockOffset=0
+  local networkBusy=false
+  local networkTicket=0
+  local reportStatus='Connecting'
+  local queryStatus=''
+  local minRate,minRank=0,6
+  local joining=false
+  local localHighlight
+  local viewerCode=PREMIUM_EDITION and AUTO_KEY or ''
+  local pageOffset,nextOffset=0,nil
+  local queryEpoch=0
+  -- ===================== AUTO JOIN STATE =====================
+  local autoJoin={enabled=false,minRate=0,minRank=0,lastAttempt=0,cooldown=8}
+  -- ===========================================================
+  local settingsPath=PREMIUM_EDITION and 'tenshi_beta_premium_ui.json' or 'top4_preview_tenshi_beta_ui.json'
+  local settings={}
+  if type(readfile)=='function' then
+     pcall(function() local data=Http:JSONDecode(readfile(settingsPath));
+    if type(data)=='table' then settings=data end
+  end)
+  end
+  if type(settings.myServer)=='boolean' then othersOnly=settings.myServer end
+  if type(settings.minRank)=='number' then
+    local saved=math.floor(settings.minRank)
+    if saved>=6 and saved<=10 then minRank=saved
+    elseif saved==0 and settings.rarityMenu=='mythic-up-v1' then minRank=0 end
+  end
+  if type(settings.autoJoin)=='table' then
+    autoJoin.enabled=settings.autoJoin.enabled==true
+    autoJoin.minRate=tonumber(settings.autoJoin.minRate) or 0
+    autoJoin.minRank=tonumber(settings.autoJoin.minRank) or 0
+  end
+  local menuHotkey=Enum.KeyCode.F
+  if type(settings.menuHotkey)=='string' then
+    pcall(function() local saved=Enum.KeyCode[settings.menuHotkey];
+    if saved and saved~=Enum.KeyCode.Unknown then menuHotkey=saved end
+  end)
+  end
+  local themeModal,loadUiAsset,syncCloseArt
+  local sharingNotice=D.label(D.gui,'EGG FINDER ON • Sharing egg sightings & server ID',UDim2.new(0,12,1,-28),UDim2.new(1,-24,0,22),Color3.fromRGB(245,245,245),12)
+  sharingNotice.Visible=false;
+  sharingNotice.TextSize=12;
+  sharingNotice.TextWrapped=true;
+  sharingNotice.TextStrokeTransparency=0.15
+  local panel=D.make('Frame',{AnchorPoint=Vector2.new(1,0.5),Position=UDim2.new(1,-18,0.5,0),Size=UDim2.new(0.94,0,0.86,0),BackgroundColor3=Color3.fromRGB(22,23,27),Visible=false},D.gui)
+  local responsiveScale=D.make('UIScale',{Scale=0.8},panel)
+  D.make('UICorner',{CornerRadius=UDim.new(0,4)},panel)
+  D.make('UIStroke',{Color=Color3.fromRGB(125,128,138),Thickness=2},panel)
+  local wallpaper=D.make('ImageLabel',{Name='TenshiWallpaper',Size=UDim2.fromScale(1,1),BackgroundTransparency=1,ImageTransparency=0.22,Image='',ScaleType=Enum.ScaleType.Crop,Active=false,ZIndex=1},panel)
+  D.make('UICorner',{CornerRadius=UDim.new(0,4)},wallpaper)
+  local wallpaperShade=D.make('Frame',{Name='WallpaperShade',Size=UDim2.fromScale(1,1),BackgroundColor3=Color3.fromRGB(10,13,26),BackgroundTransparency=0.25,BorderSizePixel=0,Active=false,ZIndex=1},wallpaper)
+  D.make('UICorner',{CornerRadius=UDim.new(0,4)},wallpaperShade)
+  local function contentLayer(child)
+    if child:IsA('GuiObject') and child~=wallpaper and not child:IsDescendantOf(wallpaper) and child.ZIndex<2 then
+       child.ZIndex=2
+    end
+  end
+  for _,child in ipairs(panel:GetDescendants()) do contentLayer(child) end
+  panel.DescendantAdded:Connect(contentLayer)
+  local bar=D.make('Frame',{Position=UDim2.fromOffset(1,1),Size=UDim2.new(1,-2,0,45),BackgroundColor3=Color3.fromRGB(46,47,52),BorderSizePixel=0},panel)
+  D.make('UICorner',{CornerRadius=UDim.new(0,4)},bar)
+  D.make('UIGradient',{Color=ColorSequence.new(Color3.fromRGB(125,130,137),Color3.fromRGB(70,72,80)),Rotation=0},bar)
+  local heading=D.label(panel,PREMIUM_EDITION and 'Jen Finder / PREMIUM' or 'Jen Finder',UDim2.fromOffset(14,8),UDim2.new(1,-55,0,32),nil,22)
+  -- Small open button (40x40)
+  local open=D.make('ImageButton',{Image='',Position=UDim2.fromOffset(18,80),Size=UDim2.fromOffset(40,40),BackgroundColor3=Color3.fromRGB(250,250,250),ScaleType=Enum.ScaleType.Fit,ClipsDescendants=true},D.gui)
+  D.make('UICorner',{CornerRadius=UDim.new(1,0)},open)
+  local iconCaption=D.label(open,'FINDER',UDim2.new(0.5,-44,1,5),UDim2.fromOffset(88,27),Color3.new(1,1,1),18)
+  open.ClipsDescendants=false
+  iconCaption.Visible=false
+  local function restorePosition(target,value)
+    if type(value)~='table' then return end
+    for i=1,4 do
+      if type(value[i])~='number' or value[i]~=value[i] or math.abs(value[i])>5000 then return end
+    end
+    target.Position=UDim2.new(value[1],value[2],value[3],value[4])
+  end
+  restorePosition(panel,settings.panel);
+  restorePosition(open,settings.icon)
+  D.publicGuiPercent=function(value,factor)
+    local n=tonumber(value) or (tonumber(factor) or 1)*100
+    if n~=n or math.abs(n)==math.huge then n=100 end
+    return math.clamp(math.floor(n/10+0.5)*10,70,150)
+  end
+  do
+    local latest
+    local function consider(value)
+      if type(value)=='table' and type(value.percent)=='number' and value.percent>=70 and value.percent<=150 and type(value.at)=='number' and (not latest or value.at>latest.at) then
+         latest=value
+      end
+    end
+    if type(readfile)=='function' then
+       pcall(function() consider(Http:JSONDecode(readfile('top4_preview_tenshi_public_gui_size_v2.json'))) end)
+    end
+    pcall(function() local data=Teleports:GetTeleportSetting('TenshiPublicGuiSizeV2');
+    if type(data)=='string' then consider(Http:JSONDecode(data)) end
+  end)
+  if latest then settings.sizePercent=latest.percent end
+  end
+  D.savePublicGuiSize=function(percent)
+    local data=Http:JSONEncode({percent=percent,at=workspace:GetServerTimeNow()*1000})
+    if type(writefile)=='function' then
+       pcall(writefile,'top4_preview_tenshi_public_gui_size_v2.json',data)
+    end
+    pcall(function() Teleports:SetTeleportSetting('TenshiPublicGuiSizeV2',data) end)
+  end
+  D.baseEggVisuals={enabled=false,hideMine=false,saved={},prompts={},renderer=nil,hidden=0,candidates={},tracking=false}
+  do
+    pcall(function() if type(readfile)=='function' then
+       D.baseEggVisuals.enabled=game:GetService('HttpService'):JSONDecode(readfile('tenshi_do_test_hide_base_eggs_v1.json'))==true
+    end
+  end)
+  pcall(function() local value=game:GetService('TeleportService'):GetTeleportSetting('TenshiDoTestHideBaseEggs');
+  if type(value)=='boolean' then D.baseEggVisuals.enabled=value end
+  end)
+  pcall(function() if type(readfile)=='function' then
+     D.baseEggVisuals.hideMine=game:GetService('HttpService'):JSONDecode(readfile('tenshi_do_test_hide_my_eggs_'..tostring(D.player.UserId)..'.json'))==true
+  end
+  end)
+  pcall(function() local value=game:GetService('TeleportService'):GetTeleportSetting('TenshiDoTestHideMyEggs_'..tostring(D.player.UserId));
+  if type(value)=='boolean' then D.baseEggVisuals.hideMine=value end
+  end)
+  end
+  D.trackEggAdornments=function()
+    local state=D.baseEggVisuals
+    if state.tracking then return end
+    state.tracking=true;
+    state.connections={}
+    local function track(obj)
+      if obj:IsA('BillboardGui') or obj:IsA('SurfaceGui') then state.candidates[obj]=true end
+      if obj:IsA('TextLabel') and not obj:IsDescendantOf(D.gui) and state.hideMine then
+        task.defer(function()
+          if active and obj.Parent and D.isOwnIncomePopup and D.isOwnIncomePopup(obj) then
+            state.candidates[obj]=true
+            if not state.saved[obj] then state.saved[obj]={Visible=obj.Visible} end
+            obj.Visible=false
+          end
+        end)
+      end
+    end
+    for _,root in pairs({workspace,D.player:FindFirstChildOfClass('PlayerGui')}) do
+      pcall(function()
+        state.connections[#state.connections+1]=root.DescendantAdded:Connect(track)
+        task.spawn(function()
+          for i,obj in ipairs(root:GetDescendants()) do
+            if not active or not state.tracking then return end
+            track(obj);
+            if i%256==0 then task.wait() end
+          end
+        end)
+      end)
+    end
+  end
+  D.restoreBaseEggVisual=function(obj)
+    local saved=D.baseEggVisuals.saved[obj]
+    if saved then
+      for property,value in pairs(saved) do
+         pcall(function()
+          obj[property]=value
+          pcall(function() obj:SetAttribute('TenshiDoTestOriginal_'..property,nil) end)
+        end)
+      end
+      D.baseEggVisuals.prompts[obj]=nil
+      D.baseEggVisuals.saved[obj]=nil
+    end
+  end
+  D.isOwnIncomePopup=function(obj)
+    if not D.baseEggVisuals.hideMine or not obj:IsA('TextLabel') or obj:IsDescendantOf(D.gui) then return false end
+    local text=obj.Text:gsub('<[^>]*>',''):gsub('%s','')
+    local color=obj.TextColor3
+    return text:match('^%+%$[%d%.,]+[%a]*$')~=nil and color.G>color.R and color.G>color.B
+  end
+  D.applyBaseEggVisibility=function()
+    local state=D.baseEggVisuals
+    local keep={}
+    if (state.enabled or state.hideMine) and state.renderer then
+      pcall(D.trackEggAdornments)
+      local players=game:GetService('Players'):GetPlayers()
+      local targets,owners={},{}
+      for _,owner in ipairs(players) do
+        if owner==D.player and state.hideMine or owner~=D.player and state.enabled then
+          local selected={};
+          pcall(state.renderer.AppendRaycastTargets,selected,owner.UserId)
+          for _,obj in ipairs(selected) do
+             targets[#targets+1]=obj;
+            owners[obj]=owner.UserId
+          end
+        end
+      end
+      local field=workspace:FindFirstChild('AreaEggSlotsClient')
+      local function protected(obj)
+        if field and (obj==field or obj:IsDescendantOf(field)) then return true end
+        for _,owner in ipairs(players) do
+           if owner.Character and (obj==owner.Character or obj:IsDescendantOf(owner.Character)) then return true end
+        end
+        return false
+      end
+      local function ownerOf(obj)
+        local at=obj
+        while at do
+           if owners[at] then return owners[at] end
+           at=at.Parent
+        end
+      end
+      local function hide(obj,own)
+        if protected(obj) then return end
+        local property,value
+        if obj:IsA('BasePart') then property='LocalTransparencyModifier'; value=1
+        elseif obj:IsA('Decal') or obj:IsA('Texture') then property='Transparency'; value=1
+        elseif obj:IsA('ParticleEmitter') or obj:IsA('Trail') or obj:IsA('Beam') or obj:IsA('BillboardGui') or obj:IsA('SurfaceGui') then property='Enabled'; value=false end
+        if D.isOwnIncomePopup(obj) then property='Visible'; value=false end
+        if not property then return end
+        keep[obj]=true
+        if not state.saved[obj] then
+          local original=obj[property]
+          pcall(function()
+            local stored=obj:GetAttribute('TenshiDoTestOriginal_'..property)
+            if stored~=nil then original=stored
+            else
+              if property=='LocalTransparencyModifier' and original==1 then original=0 end
+              obj:SetAttribute('TenshiDoTestOriginal_'..property,original)
+            end
+          end)
+          state.saved[obj]={[property]=original}
+        end
+        if obj[property]~=value then obj[property]=value end
+      end
+      for _,root in ipairs(targets) do
+        if typeof(root)=='Instance' and root.Parent and not protected(root) then
+          local own=owners[root]==D.player.UserId
+          pcall(hide,root,own)
+          for _,obj in ipairs(root:GetDescendants()) do pcall(hide,obj,own) end
+        end
+      end
+      for obj in pairs(state.candidates) do
+        if not obj.Parent then state.candidates[obj]=nil
+        elseif obj:IsA('TextLabel') and not D.isOwnIncomePopup(obj) then state.candidates[obj]=nil
+        elseif not protected(obj) then
+           pcall(function()
+            if D.isOwnIncomePopup(obj) then hide(obj,true)
+            elseif obj:IsA('BillboardGui') or obj:IsA('SurfaceGui') then
+              local adornee=obj.Adornee or obj.Parent
+              local owner=ownerOf(adornee)
+              if owner and not protected(adornee) then hide(obj,owner==D.player.UserId) end
+            end
+          end)
+        end
+      end
+    end
+    local count=0
+    for obj in pairs(state.saved) do
+       if not keep[obj] then D.restoreBaseEggVisual(obj) else count+=1 end
+    end
+    state.hidden=count
+  end
+  D.setHideBaseEggs=function(enabled)
+    D.baseEggVisuals.enabled=enabled==true
+    pcall(function() if type(writefile)=='function' then
+       writefile('tenshi_do_test_hide_base_eggs_v1.json',game:GetService('HttpService'):JSONEncode(D.baseEggVisuals.enabled))
+    end
+  end)
+  pcall(function() game:GetService('TeleportService'):SetTeleportSetting('TenshiDoTestHideBaseEggs',D.baseEggVisuals.enabled) end)
+  D.applyBaseEggVisibility()
+  end
+  D.setHideMyEggs=function(enabled)
+    D.baseEggVisuals.hideMine=enabled==true
+    pcall(function() if type(writefile)=='function' then
+       writefile('tenshi_do_test_hide_my_eggs_'..tostring(D.player.UserId)..'.json',game:GetService('HttpService'):JSONEncode(D.baseEggVisuals.hideMine))
+    end
+  end)
+  pcall(function() game:GetService('TeleportService'):SetTeleportSetting('TenshiDoTestHideMyEggs_'..tostring(D.player.UserId),D.baseEggVisuals.hideMine) end)
+  D.applyBaseEggVisibility()
+  end
+  D.gui.Destroying:Connect(function()
+    D.baseEggVisuals.enabled=false;
+    D.baseEggVisuals.hideMine=false;
+    D.baseEggVisuals.tracking=false
+    for _,connection in ipairs(D.baseEggVisuals.connections or {}) do connection:Disconnect() end
+    D.applyBaseEggVisibility()
+  end)
+  task.spawn(function()
+    while active do
+      if (D.baseEggVisuals.enabled or D.baseEggVisuals.hideMine) and not D.baseEggVisuals.renderer then
+        pcall(function()
+          local obj=game:GetService('ReplicatedStorage'):FindFirstChild('Shared')
+          obj=obj and obj:FindFirstChild('Eggs');
+          obj=obj and obj:FindFirstChild('PlacedEggRenderer')
+          if obj then
+             local renderer=require(obj);
+            if type(renderer.AppendRaycastTargets)=='function' then D.baseEggVisuals.renderer=renderer end
+          end
+        end)
+      end
+      if D.baseEggVisuals.enabled or D.baseEggVisuals.hideMine then D.applyBaseEggVisibility() end
+      if D.paintBaseEggOption then D.paintBaseEggOption() end
+      if D.paintMyEggOption then D.paintMyEggOption() end
+      task.wait(1)
+    end
+  end)
+  D.nightSky={enabled=false,writing=false,skies={},clock=nil,created=nil}
+  D.applyNightSky=function()
+    local state=D.nightSky
+    if not state.enabled or state.writing then return end
+    local lighting=game:GetService('Lighting')
+    state.writing=true
+    if lighting.ClockTime~=22 then lighting.ClockTime=22 end
+    for _,sky in ipairs(lighting:GetChildren()) do
+      if sky:IsA('Sky') then
+        if not state.skies[sky] then state.skies[sky]={stars=sky.StarCount,bodies=sky.CelestialBodiesShown} end
+        sky.StarCount=3000;
+        sky.CelestialBodiesShown=true
+      end
+    end
+    state.writing=false
+  end
+  D.setNightSky=function(enabled,persist)
+    local state=D.nightSky;
+    local lighting=game:GetService('Lighting')
+    enabled=enabled==true
+    if enabled and not state.enabled then
+      state.clock=lighting.ClockTime;
+      state.enabled=true
+      if not lighting:FindFirstChildOfClass('Sky') then
+         state.created=Instance.new('Sky');
+        state.created.Name='JenNightSky';
+        state.created.Parent=lighting
+      end
+      D.applyNightSky()
+    elseif not enabled and state.enabled then
+      state.enabled=false;
+      state.writing=true
+      local restore=tonumber(state.clock)
+      if not restore then restore=14 end
+      lighting.ClockTime=restore
+      for sky,saved in pairs(state.skies) do
+         pcall(function() sky.StarCount=saved.stars; sky.CelestialBodiesShown=saved.bodies end)
+      end
+    end
+    state.skies={}
+    if state.created then
+       state.created:Destroy();
+      state.created=nil
+    end
+    state.writing=false
+  end
+  if persist~=false then
+    if type(writefile)=='function' then
+       pcall(function() writefile('tenshi_do_test_night_sky_'..tostring(D.player.UserId)..'.json',Http:JSONEncode(enabled)) end)
+    end
+    pcall(function() Teleports:SetTeleportSetting('TenshiDoTestNightSky_'..tostring(D.player.UserId),enabled) end)
+  end
+  if D.paintNightSkyOption then D.paintNightSkyOption() end
+  end
+  D.installNightSky=function()
+    local lighting=game:GetService('Lighting')
+    local changed=lighting:GetPropertyChangedSignal('ClockTime'):Connect(function()
+      local state=D.nightSky
+      if state.enabled and not state.writing and lighting.ClockTime~=22 then
+         state.clock=lighting.ClockTime;
+        D.applyNightSky()
+      end
+    end)
+    local added=lighting.ChildAdded:Connect(function(child) if child:IsA('Sky') and D.nightSky.enabled then D.applyNightSky() end end)
+    D.gui.Destroying:Connect(function() changed:Disconnect(); added:Disconnect(); D.setNightSky(false,false) end)
+    local enabled=false
+    pcall(function() if type(readfile)=='function' then
+       enabled=Http:JSONDecode(readfile('tenshi_do_test_night_sky_'..tostring(D.player.UserId)..'.json'))==true
+    end
+    end)
+    pcall(function() local value=Teleports:GetTeleportSetting('TenshiDoTestNightSky_'..tostring(D.player.UserId));
+    if type(value)=='boolean' then enabled=value end
+    end)
+    D.setNightSky(enabled,false)
+  end
+  D.installNightSky()
+  local sizePercent=D.publicGuiPercent(settings.sizePercent,settings.sizeFactor)
+  local sizeFactor=sizePercent/100
+  local launcherScale=D.make('UIScale',{Scale=0.8},open)
+  local function fitFinder()
+    local view=D.gui.AbsoluteSize
+    if view.X<=0 or view.Y<=0 then return end
+    local landscape=view.X>view.Y
+    local width=math.min(321.6*sizeFactor,view.X*(landscape and 0.40 or 0.92),view.X-16)
+    local height=math.min(645*(0.36+0.64*sizeFactor),view.Y*0.90)
+    local scale=math.min(0.8*sizeFactor,width/402,height/772)
+    responsiveScale.Scale=scale
+    panel.Size=UDim2.fromOffset(402,height/scale)
+    D.launcherBaseScale=math.min(0.8,math.max(0.5,math.min(view.X,view.Y)/650))
+    launcherScale.Scale=D.launcherBaseScale*(D.launcherPressed and 1.10 or 1)
+    local function keepVisible(target,caption)
+      local size=target.AbsoluteSize
+      local p=target.Position
+      local anchor=target.AnchorPoint
+      local x=p.X.Scale*view.X+p.X.Offset
+      local y=p.Y.Scale*view.Y+p.Y.Offset
+      x=math.clamp(x,8+size.X*anchor.X,math.max(8+size.X*anchor.X,view.X-8-size.X*(1-anchor.X)))
+      y=math.clamp(y,8+size.Y*anchor.Y,math.max(8+size.Y*anchor.Y,view.Y-8-caption-size.Y*(1-anchor.Y)))
+      target.Position=UDim2.fromScale(x/view.X,y/view.Y)
+    end
+    task.defer(function()
+      if panel.Parent then
+         keepVisible(panel,0);
+        keepVisible(open,28*launcherScale.Scale)
+      end
+    end)
+  end
+  local resizeConnection=D.gui:GetPropertyChangedSignal('AbsoluteSize'):Connect(fitFinder)
+  D.gui.Destroying:Connect(function() resizeConnection:Disconnect() end)
+  task.defer(fitFinder)
+  local function saveSettings()
+    pcall(D.savePublicGuiSize,sizePercent)
+    if type(writefile)~='function' then return end
+    pcall(function()
+      local function coords(p) return {p.X.Scale,p.X.Offset,p.Y.Scale,p.Y.Offset} end
+      writefile(settingsPath,Http:JSONEncode({
+        myServer=othersOnly,minRank=minRank,rarityMenu='mythic-up-v1',
+        menuHotkey=menuHotkey.Name,hotkeyDefaultVersion=2,
+        sizeFactor=sizeFactor,sizePercent=sizePercent,
+        panel=coords(panel.Position),icon=coords(open.Position),
+        autoJoin={enabled=autoJoin.enabled,minRate=autoJoin.minRate,minRank=autoJoin.minRank}
+      }))
+    end)
+  end
+  D.saveGuiBeforeTeleport=saveSettings
+  heading.Size=UDim2.fromOffset(185,32)
+  heading.TextSize=19
+  local brandLogo=D.make('ImageLabel',{Name='JenBrandLogo',Position=UDim2.fromOffset(10,2),Size=UDim2.fromOffset(180,42),BackgroundTransparency=1,Image='',ScaleType=Enum.ScaleType.Fit,Active=true},panel)
+  brandLogo.Visible=false
+  heading.Text='Jen Finder'
+  heading.TextSize=18
+  heading.Font=Enum.Font.Arcade
+  heading.TextScaled=true
+  heading.TextWrapped=false
+  heading.TextTruncate=Enum.TextTruncate.None
+  D.make('UITextSizeConstraint',{MinTextSize=1,MaxTextSize=20},heading)
+  heading.Size=UDim2.fromOffset(205,25)
+  heading.Position=UDim2.fromOffset(10,2)
+  heading.TextStrokeTransparency=0.65
+  open.BackgroundTransparency=1
+  for _,decoration in ipairs(open:GetChildren()) do
+    if decoration:IsA('UIStroke') then decoration.Enabled=false end
+  end
+  -- Load custom Jen button image
+  task.spawn(function()
+    local asset=getcustomasset or getsynasset
+    if type(asset)~='function' or type(writefile)~='function' then return end
+    local ok,result=pcall(function()
+      local bytes=game:HttpGet('https://raw.githubusercontent.com/mallu837/sae/main/Jen.png')
+      if #bytes<100 then return end
+      writefile('jen_public_button.png',bytes)
+      return asset('jen_public_button.png')
+    end)
+    if ok and type(result)=='string' and open.Parent then
+      open.ImageRectOffset=Vector2.new(0,0)
+      open.ImageRectSize=Vector2.new(0,0)
+      open.Image=result
+    end
+  end)
+  local sizeMinus=D.make('TextButton',{Name='SizeMinus',Text='',Position=UDim2.new(1,-182,0,3),Size=UDim2.fromOffset(40,40),BackgroundColor3=Color3.fromRGB(190,45,55),TextColor3=Color3.new(1,1,1)},panel)
+  local sizePlus=D.make('TextButton',{Name='SizePlus',Text='',Position=UDim2.new(1,-94,0,3),Size=UDim2.fromOffset(40,40),BackgroundColor3=Color3.fromRGB(45,150,80),TextColor3=Color3.new(1,1,1)},panel)
+  local sizeLabel=D.label(panel,'100%',UDim2.new(1,-138,0,13),UDim2.fromOffset(40,20),Color3.new(1,1,1),14)
+  sizeLabel.TextXAlignment=Enum.TextXAlignment.Center
+  sizeLabel.TextScaled=true;
+  sizeLabel.TextWrapped=false
+  D.make('UITextSizeConstraint',{MinTextSize=1,MaxTextSize=14},sizeLabel)
+  for _,button in ipairs({sizeMinus,sizePlus}) do
+    local corner=button:FindFirstChildOfClass('UICorner')
+    if corner then corner.CornerRadius=UDim.new(0,6) end
+    local line=D.make('Frame',{AnchorPoint=Vector2.new(0.5,0.5),Position=UDim2.fromScale(0.5,0.5),Size=UDim2.fromOffset(16,4),BackgroundColor3=Color3.new(1,1,1),BorderSizePixel=0},button)
+    D.make('UICorner',{CornerRadius=UDim.new(1,0)},line)
+  end
+  local upright=D.make('Frame',{AnchorPoint=Vector2.new(0.5,0.5),Position=UDim2.fromScale(0.5,0.5),Size=UDim2.fromOffset(4,16),BackgroundColor3=Color3.new(1,1,1),BorderSizePixel=0},sizePlus)
+  D.make('UICorner',{CornerRadius=UDim.new(1,0)},upright)
+  local function paintSize()
+    sizeLabel.Text=tostring(sizePercent)..'%'
+    sizeMinus.Active=sizePercent>70;
+    sizeMinus.Selectable=sizePercent>70
+    sizePlus.Active=sizePercent<150;
+    sizePlus.Selectable=sizePercent<150
+  end
+  local function changeSizeBy(delta)
+    local nextPercent=math.clamp(sizePercent+delta,70,150)
+    if nextPercent==sizePercent then return end
+    sizePercent=nextPercent;
+    sizeFactor=sizePercent/100
+    paintSize();
+    fitFinder();
+    saveSettings()
+  end
+  sizeMinus.Activated:Connect(function() changeSizeBy(-10) end)
+  sizePlus.Activated:Connect(function() changeSizeBy(10) end)
+  paintSize()
+  local close=D.make('TextButton',{Text='×',Position=UDim2.new(1,-33,0,4),Size=UDim2.fromOffset(28,28),BackgroundColor3=Color3.fromRGB(160,35,50),TextColor3=Color3.new(1,1,1),TextSize=22},panel)
+  local closeArt=D.make('ImageLabel',{Size=UDim2.fromScale(1,1),BackgroundTransparency=1,Image='',ScaleType=Enum.ScaleType.Fit,Active=false},close)
+  task.spawn(function()
+    local asset=getcustomasset or getsynasset
+    if type(asset)~='function' or type(writefile)~='function' then return end
+    local ok,result=pcall(function()
+      local bytes=game:HttpGet('https://raw.githubusercontent.com/mallu837/sae/main/Jen.png')
+      writefile('jen_public_close.png',bytes)
+      return asset('jen_public_close.png')
+    end)
+    if ok and type(result)=='string' and close.Parent then
+      closeArt.Image=result;
+      close.Text='';
+      close.BackgroundTransparency=1
+    end
+  end)
+  local suppressOpenUntil=0
+  open.Activated:Connect(function() if os.clock()<suppressOpenUntil then return end;
+   panel.Visible=not panel.Visible;
+   D.localPanel.Visible=not panel.Visible
+  end)
+  close.Activated:Connect(function() panel.Visible=false; D.localPanel.Visible=true end)
+  local Input=game:GetService('UserInputService')
+  local drag
+  D.setLauncherPressed=function(pressed)
+    if D.launcherPressed==pressed then return end
+    D.launcherPressed=pressed
+    if D.launcherPressTween then D.launcherPressTween:Cancel() end
+    local target=(D.launcherBaseScale or 0.8)*(pressed and 1.10 or 1)
+    D.launcherPressTween=game:GetService('TweenService'):Create(launcherScale,TweenInfo.new(pressed and 0.09 or 0.14,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),{Scale=target})
+    D.launcherPressTween:Play()
+  end
+  local function draggable(target,handle,isLauncher)
+    handle.Active=true
+    handle.InputBegan:Connect(function(input)
+      if input.UserInputType~=Enum.UserInputType.MouseButton1 and input.UserInputType~=Enum.UserInputType.Touch then return end
+      drag={target=target,input=input,start=input.Position,position=target.Position,absolute=target.AbsolutePosition,size=target.AbsoluteSize,launcher=isLauncher,moved=false}
+      if isLauncher then D.setLauncherPressed(true) end
+    end)
+  end
+  draggable(panel,heading,false)
+  draggable(panel,bar,false)
+  draggable(open,open,true)
+  local launcherHit=D.make('TextButton',{Name='LauncherHitArea',Text='',AutoButtonColor=false,BackgroundTransparency=1,Position=UDim2.fromOffset(-8,-8),Size=UDim2.new(1,16,1,16),ZIndex=5},open)
+  draggable(open,launcherHit,true)
+  launcherHit.Activated:Connect(function()
+    if os.clock()<suppressOpenUntil then return end
+    panel.Visible=not panel.Visible;
+    D.localPanel.Visible=not panel.Visible
+  end)
+  Input.InputEnded:Connect(function(input)
+    if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then
+       D.setLauncherPressed(false)
+    end
+  end)
+  local moveConnection=Input.InputChanged:Connect(function(input)
+    if not drag then return end
+    local mouse=drag.input.UserInputType==Enum.UserInputType.MouseButton1
+    if (mouse and input.UserInputType~=Enum.UserInputType.MouseMovement) or (not mouse and input~=drag.input) then return end
+    local dx,dy=input.Position.X-drag.start.X,input.Position.Y-drag.start.Y
+    if dx*dx+dy*dy>25 then drag.moved=true end
+    if not drag.moved then return end
+    if drag.launcher then suppressOpenUntil=os.clock()+0.5 end
+    local view=D.gui.AbsoluteSize
+    local origin=D.gui.AbsolutePosition
+    if view.X<=0 or view.Y<=0 then return end
+    local left=drag.absolute.X-origin.X
+    local top=drag.absolute.Y-origin.Y
+    local x=math.clamp(left+dx,0,math.max(0,view.X-drag.size.X))
+    local y=math.clamp(top+dy,0,math.max(0,view.Y-drag.size.Y-(drag.launcher and 28*launcherScale.Scale or 0)))
+    local anchor=drag.target.AnchorPoint
+    drag.target.Position=UDim2.fromScale((x+anchor.X*drag.size.X)/view.X,(y+anchor.Y*drag.size.Y)/view.Y)
+  end)
+  local endConnection=Input.InputEnded:Connect(function(input)
+    if drag and (input==drag.input or input.UserInputType==Enum.UserInputType.MouseButton1) then
+      if drag.moved and drag.launcher then suppressOpenUntil=os.clock()+0.3 end
+      if drag.moved then saveSettings() end
+      drag=nil
+    end
+  end)
+  D.gui.Destroying:Connect(function() moveConnection:Disconnect(); endConnection:Disconnect(); drag=nil end)
+  local status=D.label(panel,'Connecting…',UDim2.fromOffset(14,52),UDim2.new(1,-28,0,48),Color3.fromRGB(210,218,240),14)
+  status.Visible=false
+  status.TextWrapped=true
+  if not PREMIUM_EDITION then status.Size=UDim2.new(1,-28,0,24) end
+  local discordSubtitle=D.label(panel,DISCORD,UDim2.fromOffset(10,27),UDim2.fromOffset(205,14),Color3.new(1,1,1),11)
+  discordSubtitle.TextSize=11
+  discordSubtitle.TextScaled=true;
+  discordSubtitle.TextWrapped=false;
+  discordSubtitle.Visible=true
+  D.make('UITextSizeConstraint',{MinTextSize=1,MaxTextSize=11},discordSubtitle)
+  local page={Text=''}
+  local scope=D.make('TextButton',{Name='AllServers',Text='ALL SERVERS',Position=UDim2.new(0,10,1,-136),Size=UDim2.new(0.5,-15,0,34),BackgroundColor3=Color3.fromRGB(67,70,80),TextColor3=Color3.new(1,1,1),TextSize=14},panel)
+  local myScope=D.make('TextButton',{Name='MyServer',Text='MY SERVER',Position=UDim2.new(0.5,5,1,-136),Size=UDim2.new(0.5,-15,0,34),BackgroundColor3=Color3.fromRGB(67,70,80),TextColor3=Color3.new(1,1,1),TextSize=14},panel)
+  for _,button in ipairs({scope,myScope}) do
+    button.TextScaled=true;
+    button.TextWrapped=false
+    D.make('UITextSizeConstraint',{MinTextSize=1,MaxTextSize=14},button)
+  end
+  local function styleScope()
+    scope.BackgroundColor3=othersOnly and Color3.fromRGB(67,70,80) or Color3.fromRGB(45,130,75)
+    myScope.BackgroundColor3=othersOnly and Color3.fromRGB(45,130,75) or Color3.fromRGB(67,70,80)
+    scope.TextColor3=Color3.new(1,1,1);
+    myScope.TextColor3=Color3.new(1,1,1)
+  end
+  local requestScopeRender
+  local function setScope(myServer)
+    if othersOnly==myServer then return end
+    othersOnly=myServer;
+    styleScope()
+    page.Text=othersOnly and 'LOCAL EGGS' or PREMIUM_EDITION and 'GLOBAL TOP 10' or 'TOP 30'
+    queryEpoch+=1;
+    pageOffset=0;
+    feedAt=-math.huge;
+    task.defer(saveSettings)
+    if requestScopeRender then requestScopeRender() end
+  end
+  scope.Activated:Connect(function() setScope(false) end)
+  myScope.Activated:Connect(function() setScope(true) end)
+  styleScope()
+  local rarityOptions={{name='Any',rank=0},{name='Cosmic',rank=7},{name='Secret',rank=8},{name='Eternal',rank=9},{name='Divine',rank=10}}
+  local rarityIndex=1
+  for i,option in ipairs(rarityOptions) do
+     if option.rank==minRank then rarityIndex=i; break end
+  end
+  minRank=rarityOptions[rarityIndex].rank
+  local function rarityButtonText()
+    local name=rarityOptions[rarityIndex].name
+    local colors={Mythic='#FF4B55',Cosmic='#BE55FF',Secret='#FFFFFF',Eternal='#DACAEC',Divine='#FFCD37',Any='#FFFFFF'}
+    return 'MIN RARITY: <font color="'..colors[name]..'">'..name..'</font>'
+  end
+  local rarity=D.make('TextButton',{Text=rarityButtonText(),RichText=true,Position=UDim2.new(0,10,1,-96),Size=UDim2.new(0.52,-14,0,36),BackgroundColor3=Color3.fromRGB(45,90,175),TextColor3=Color3.new(1,1,1),TextSize=12},panel)
+  rarity.Activated:Connect(function()
+    rarityIndex=rarityIndex%#rarityOptions+1;
+    minRank=rarityOptions[rarityIndex].rank
+    rarity.Text=rarityButtonText()
+    queryEpoch+=1;
+    feed={};
+    pageOffset=0;
+    feedAt=-math.huge;
+    saveSettings()
+  end)
+  D.sortOptions={'Value','Weight','Rarity'}
+  D.sortIndex=1
+  D.sortButton=D.make('TextButton',{Name='SortBy',Text='SORT BY: Value',Position=UDim2.new(0.52,4,1,-96),Size=UDim2.new(0.48,-14,0,36),BackgroundColor3=rarity.BackgroundColor3,TextColor3=Color3.new(1,1,1),TextSize=12},panel)
+  D.sortButton.Activated:Connect(function()
+    D.sortIndex=D.sortIndex%#D.sortOptions+1
+    D.sortButton.Text='SORT BY: '..D.sortOptions[D.sortIndex]
+    queryEpoch+=1
+    if requestScopeRender then requestScopeRender() end
+  end)
+  local access=PREMIUM_EDITION and AUTO_KEY=='' and D.make('TextBox',{Text='',PlaceholderText='PREMIUM code (top 10)',Position=UDim2.new(0,10,1,-44),Size=UDim2.new(1,-20,0,34),ClearTextOnFocus=false,BackgroundColor3=Color3.fromRGB(45,48,60),TextColor3=Color3.new(1,1,1),TextSize=12},panel) or {Text=''}
+  local unlock=D.make('TextButton',{Text='PREMIUM',Position=UDim2.new(0.70,4,1,-52),Size=UDim2.new(0.30,-14,0,40),BackgroundColor3=Color3.fromRGB(210,170,35),TextColor3=Color3.new(1,1,1),TextSize=12},panel)
+  access.Visible=PREMIUM_EDITION and AUTO_KEY==''
+  if PREMIUM_EDITION and AUTO_KEY~='' then
+    unlock.Visible=false
+    D.label(panel,'PREMIUM',UDim2.new(0.60,5,0,106),UDim2.new(0.40,-15,0,36),Color3.new(1,1,1),15)
+  end
+  local copy=D.make('TextButton',{Text='COPY DISCORD LINK',Position=UDim2.fromOffset(10,176),Size=UDim2.new(1,-110,0,27),BackgroundColor3=Color3.fromRGB(65,75,135),TextColor3=Color3.new(1,1,1),TextSize=12,Visible=not PREMIUM_EDITION},panel)
+  copy.Visible=false
+  local premiumPopup
+  local function showPremiumPopup()
+    if premiumPopup then premiumPopup.Visible=true; return end
+    premiumPopup=D.make('Frame',{Size=UDim2.fromScale(1,1),BackgroundColor3=Color3.new(0,0,0),BackgroundTransparency=0.3,Active=true,ZIndex=30},panel)
+    local box=D.make('Frame',{AnchorPoint=Vector2.new(0.5,0.5),Position=UDim2.fromScale(0.5,0.5),Size=UDim2.new(1,-28,0,232),BackgroundColor3=Color3.fromRGB(43,45,50),ZIndex=31},premiumPopup)
+    D.make('UICorner',{CornerRadius=UDim.new(0,4)},box)
+    themeModal(box)
+    local discordMark=D.make('ImageLabel',{Name='PremiumDiscordIcon',Image='',AnchorPoint=Vector2.new(0.5,0),Position=UDim2.new(0.5,0,0,8),Size=UDim2.fromOffset(80,66),BackgroundTransparency=1,ScaleType=Enum.ScaleType.Fit,Active=false,ZIndex=32},box)
+    loadUiAsset(discordMark,'discord')
+    local title=D.label(box,'JOIN DISCORD TO GET PREMIUM',UDim2.fromOffset(12,76),UDim2.new(1,-24,0,52),Color3.new(1,1,1),20)
+    title.Font=Enum.Font.FredokaOne;
+    title.TextScaled=true;
+    title.TextWrapped=true;
+    title.TextXAlignment=Enum.TextXAlignment.Center;
+    title.ZIndex=32
+    D.make('UITextSizeConstraint',{MinTextSize=12,MaxTextSize=21},title)
+    local bar=D.make('Frame',{Position=UDim2.fromOffset(12,148),Size=UDim2.new(1,-24,0,64),BackgroundColor3=Color3.fromRGB(57,60,68),ZIndex=32},box)
+    D.make('UICorner',{CornerRadius=UDim.new(0,5)},bar)
+    local link=D.label(bar,DISCORD,UDim2.fromOffset(8,6),UDim2.new(1,-116,1,-12),Color3.fromRGB(200,210,255),12)
+    link.TextSize=12;
+    link.TextWrapped=true;
+    link.ZIndex=33
+    local popupCopy=D.make('TextButton',{Font=Enum.Font.FredokaOne,Text='COPY LINK',Position=UDim2.new(1,-103,0.5,-18),Size=UDim2.fromOffset(96,36),BackgroundColor3=Color3.fromRGB(85,105,220),TextColor3=Color3.new(1,1,1),TextSize=14,ZIndex=33},bar)
+    popupCopy.Font=Enum.Font.FredokaOne
+    popupCopy.Activated:Connect(function()
+      if type(setclipboard)=='function' and pcall(setclipboard,DISCORD) then
+        popupCopy.Text='COPIED'
+        task.delay(1.5,function() if active then popupCopy.Text='COPY LINK' end end)
+      else
+        popupCopy.Text='COPY UNAVAILABLE'
+      end
+    end)
+    local dismiss=D.make('TextButton',{Text='×',Position=UDim2.new(1,-34,0,5),Size=UDim2.fromOffset(28,26),BackgroundColor3=Color3.fromRGB(135,55,90),TextColor3=Color3.new(1,1,1),TextSize=22,ZIndex=32},box)
+    syncCloseArt(dismiss)
+    dismiss.Activated:Connect(function() premiumPopup.Visible=false end)
+  end
+  unlock.Activated:Connect(function()
+    if not PREMIUM_EDITION then showPremiumPopup(); return end
+    pageOffset=0
+    if viewerCode~='' then
+       viewerCode=''; feed={}; feedAt=-math.huge; unlock.Text='PREMIUM'; queryStatus='Public Finder'; return
+    end
+    viewerCode=access.Text:match('^%s*(.-)%s*$');
+    access.Text=''; feed={}; feedAt=-math.huge
+    queryStatus='Checking access code'
+  end)
+  local refreshButton=D.make('TextButton',{Text='REFRESH',Position=UDim2.fromOffset(10,54),Size=UDim2.new(1,-20,0,30),BackgroundColor3=Color3.fromRGB(64,133,31),BackgroundTransparency=0.15,TextColor3=Color3.new(1,1,1),TextSize=14},panel)
+  local resetTimer=D.label(refreshButton,'RESET --:--',UDim2.fromOffset(8,0),UDim2.new(0.28,-8,1,0),Color3.fromRGB(230,245,255),13)
+  resetTimer.TextXAlignment=Enum.TextXAlignment.Left
+  resetTimer.TextTruncate=Enum.TextTruncate.AtEnd
+  resetTimer.Active=false
+  local refreshing=false
+  do
+    local row=D.make('Frame',{Name='BestLocalEgg',Visible=false,Active=false,ClipsDescendants=true,AutomaticSize=Enum.AutomaticSize.None,BorderSizePixel=0,
+    Position=UDim2.new(0,14,1,-196),Size=UDim2.new(1,-28,0,54),BackgroundColor3=Color3.fromRGB(32,33,38),BackgroundTransparency=0.50},panel)
+    D.make('UICorner',{CornerRadius=UDim.new(0,3)},row)
+    D.make('UIStroke',{Color=Color3.fromRGB(114,116,125),Transparency=0.44,Thickness=1},row)
+    D.make('UIGradient',{Color=ColorSequence.new(Color3.new(1,1,1),Color3.fromRGB(174,176,184)),Rotation=90},row)
+    local function cardText(name,text,x,y,width,height,size,color)
+      local label=D.make('TextLabel',{Name=name,Text=text,Position=UDim2.fromOffset(x,y),Size=UDim2.fromOffset(width,height),BackgroundTransparency=1,
+      Active=false,Font=Enum.Font.FredokaOne,TextSize=size,TextScaled=true,TextWrapped=false,TextXAlignment=Enum.TextXAlignment.Left,TextColor3=color},row)
+      D.make('UITextSizeConstraint',{MinTextSize=1,MaxTextSize=size},label)
+      D.make('UIStroke',{Color=Color3.fromRGB(11,9,14),Thickness=2},label)
+      return label
+    end
+    local white=Color3.fromRGB(240,240,246)
+    local icon=D.make('ImageLabel',{Name='PetIcon',Image='',Position=UDim2.fromOffset(4,4),Size=UDim2.fromOffset(46,46),BackgroundTransparency=1,ScaleType=Enum.ScaleType.Fit,Active=false},row)
+    local petName=cardText('PetName','MY BEST: —',55,4,223,22,21,white)
+    petName.Font=Enum.Font.FredokaOne
+    petName:FindFirstChildOfClass('UIStroke').Thickness=1.1
+    local status=D.make('TextLabel',{Name='EggStatus',Text='',Position=UDim2.new(1,-91,0.5,-13),Size=UDim2.fromOffset(84,26),Visible=false,Active=false,
+    TextScaled=true,TextWrapped=false,Font=Enum.Font.FredokaOne,TextSize=17,TextColor3=white,BackgroundColor3=Color3.fromRGB(86,90,100)},row)
+    D.make('UICorner',{CornerRadius=UDim.new(0,3)},status)
+    D.bestLocalCard={row=row,icon=icon,name=petName,
+    income=cardText('Income','',55,28,100,20,17,Color3.fromRGB(23,255,0)),
+    size=cardText('Weight','',158,28,120,20,15,white),status=status}
+  end
+  local list=D.make('ScrollingFrame',{Position=UDim2.fromOffset(14,92),Size=UDim2.new(1,-16,1,-296),BackgroundTransparency=1,BorderSizePixel=0,AutomaticCanvasSize=Enum.AutomaticSize.None,CanvasSize=UDim2.new(),ScrollBarThickness=6,ScrollBarImageColor3=Color3.fromRGB(137,140,150),ScrollBarImageTransparency=0},panel)
+  D.make('UIListLayout',{Padding=UDim.new(0,4),SortOrder=Enum.SortOrder.LayoutOrder},list)
+  local loadingVisible=true
+  local function loadingText(now) return 'Loading '..string.rep('.',math.floor(now/0.4)%3+1) end
+  local aliveMessage=D.label(list,loadingText(os.clock()),UDim2.new(),UDim2.new(1,-10,0,40),nil,12)
+  local function network(url,method,body,headers,raw,timeout,independent)
+    if type(requestFn)~='function' then return nil,'Executor HTTP POST unavailable' end
+    local ticket
+    if not independent then
+      if networkBusy then return nil,'Network request still pending' end
+      networkBusy=true;
+      networkTicket+=1;
+      ticket=networkTicket
+    end
+    local done,result=false,nil
+    local worker=task.spawn(function()
+      result=table.pack(pcall(requestFn,{Url=url,Method=method,Headers=headers or {},Body=body,Timeout=timeout or 10}))
+      done=true;
+       if ticket and networkTicket==ticket then networkBusy=false end
+    end)
+    local deadline=os.clock()+(timeout and timeout+0.5 or 12)
+    while active and not done and os.clock()<deadline do task.wait(0.1) end
+    if not done then
+      if ticket and networkTicket==ticket then
+         networkTicket+=1;
+        networkBusy=false
+      end
+      pcall(task.cancel,worker)
+      return nil,'Network timeout'
+    end
+    if not result[1] then return nil,'Network request failed' end
+    local response=result[2]
+    if type(response)~='table' then return nil,'Invalid HTTP response' end
+    local code=tonumber(response.StatusCode or response.Status)
+    if code~=200 then
+      local message='HTTP '..tostring(code)
+      local good,details=pcall(Http.JSONDecode,Http,response.Body or '')
+      if good and type(details)=='table' and type(details.error)=='string' then
+         message=message..': '..details.error:sub(1,120)
+      end
+      return nil,message
+    end
+    if raw then return response.Body end
+    local ok,decoded=pcall(Http.JSONDecode,Http,response.Body or '')
+    if not ok then return nil,'Invalid JSON response' end
+    return decoded
+  end
+  status.Size=UDim2.new(0.53,-14,0,24)
+  status.TextSize=11
+  local randomJoin=D.make('TextButton',{Name='RandomServer',Text='JOIN RANDOM SERVER',Position=UDim2.new(0,10,1,-52),Size=UDim2.new(0.70,-14,0,40),BackgroundColor3=Color3.fromRGB(195,38,55),TextColor3=Color3.new(1,1,1),TextSize=12,Font=Enum.Font.GothamBold},panel)
+  D.make('UICorner',{CornerRadius=UDim.new(0,6)},randomJoin)
+  randomJoin.TextScaled=true;
+  randomJoin.TextWrapped=false
+  D.make('UITextSizeConstraint',{MinTextSize=1,MaxTextSize=14},randomJoin)
+  local featureConfig=nil
+  local randomBusy=false
+  local randomRetryAt=0
+  local recentRandom={}
+  local recentRandomPath='top4_preview_tenshi_beta_random_recent_v1.json'
+  pcall(function()
+    if type(readfile)=='function' then
+      local saved=Http:JSONDecode(readfile(recentRandomPath))
+      if type(saved)=='table' then
+         for _,id in ipairs(saved) do
+           if type(id)=='string' and #recentRandom<20 then recentRandom[#recentRandom+1]=id end
+        end
+      end
+    end
+  end)
+  local function rememberRandom(id)
+    for i=#recentRandom,1,-1 do
+       if recentRandom[i]==id then table.remove(recentRandom,i) end
+    end
+    recentRandom[#recentRandom+1]=id
+    while #recentRandom>20 do table.remove(recentRandom,1) end
+    if type(writefile)=='function' then
+       pcall(function() writefile(recentRandomPath,Http:JSONEncode(recentRandom)) end)
+    end
+  end
+  local function friendServerExclusions()
+    local ok,friends=pcall(function() return D.player:GetFriendsOnlineAsync(200) end)
+    if not ok then ok,friends=pcall(function() return D.player:GetFriendsOnline(200) end) end
+    if not ok or type(friends)~='table' then error('Cannot check friend servers; try again') end
+    local excluded={[game.JobId]=true}
+    for _,friend in ipairs(friends) do
+      local place=tonumber(friend.PlaceId or friend.placeId)
+      local id=friend.GameId or friend.gameId or friend.JobId or friend.jobId
+      if type(id)=='string' and id~='' then excluded[id]=true
+      elseif place==game.PlaceId then
+        local success,current,_,friendPlace,friendJob=pcall(function() return Teleports:GetPlayerPlaceInstanceAsync(friend.VisitorId or friend.visitorId) end)
+        if success and tonumber(friendPlace)==game.PlaceId and type(friendJob)=='string' and friendJob~='' then
+           excluded[friendJob]=true
+        elseif success and current==true then excluded[game.JobId]=true
+        else error('Friend server location unavailable; try again') end
+      end
+    end
+    return excluded
+  end
+  D.randomRejectedUntil={}
+  D.fewestRandomCandidates=function(servers,excluded,now)
+    local lowest=math.huge
+    local choices,fresh,seen={},{},{}
+    for id,untilAt in pairs(D.randomRejectedUntil) do
+       if now>=untilAt then D.randomRejectedUntil[id]=nil end
+    end
+    for _,server in ipairs(servers) do
+      local id=server.id
+      local playing,maxPlayers=tonumber(server.playing),tonumber(server.maxPlayers)
+      local observed=D.populationReports and D.populationReports[id]
+      if observed and os.clock()-observed.observedAt<=12 then playing=observed.count end
+      if type(id)=='string' and id~='' and not seen[id] and not excluded[id] and not D.randomRejectedUntil[id]
+      and playing and maxPlayers and playing>=0 and playing<maxPlayers and playing<=lowest then
+        seen[id]=true
+        if playing<lowest then
+           lowest=playing;
+          choices={};
+          fresh={}
+        end
+        choices[#choices+1]=id
+        if not table.find(recentRandom,id) then fresh[#fresh+1]=id end
+      end
+    end
+    return #fresh>0 and fresh or choices
+  end
+  local function finishRandom(run,cooldown,message)
+    if not active or D.randomRun~=run then return end
+    D.randomRun=nil
+    randomBusy=false
+    joining=false
+    randomRetryAt=os.clock()+cooldown
+    randomJoin.Active=true
+    randomJoin.AutoButtonColor=true
+    randomJoin.Text='TRY AGAIN'
+    if cooldown>=3 then
+      local retryAt=randomRetryAt
+      randomJoin.Active=false
+      randomJoin.AutoButtonColor=false
+      randomJoin.Text='WAIT '..tostring(cooldown)..'s'
+      task.delay(cooldown,function()
+        if active and not randomBusy and randomRetryAt==retryAt then
+          randomJoin.Active=true
+          randomJoin.AutoButtonColor=true
+          randomJoin.Text='TRY AGAIN'
+        end
+      end)
+    end
+    if message then queryStatus='Random server: '..tostring(message) end
+  end
+  D.handleRandomFailure=function(run,target,result,message)
+    if not active or D.randomRun~=run or run.target~=target then return end
+    run.target=nil
+    local failure=tostring(message):lower()
+    local retryable=D.isFullFailure(result,message) or result==Enum.TeleportResult.GameEnded
+    or result==Enum.TeleportResult.Failure or failure:find('unknown exception',1,true)
+    or failure:find('unexpected error',1,true)
+    local flooded=result==Enum.TeleportResult.Flooded or failure:find('flood',1,true)
+    if retryable and not flooded then
+      D.randomRejectedUntil[target]=os.clock()+60
+      if run.attempts<4 and os.clock()+2<run.deadline then
+        randomJoin.Text='SEARCHING...'
+        task.delay(2,function() D.tryRandomTarget(run) end)
+        return
+      end
+    end
+    finishRandom(run,flooded and 15 or 0.75,message)
+  end
+  D.tryRandomTarget=function(run)
+    if not active or D.randomRun~=run then return end
+    if os.clock()>=run.deadline then finishRandom(run,0.75,'Server list expired'); return end
+    if run.attempts==2 or os.clock()-run.directoryAt>=8 then
+      local ok,err=pcall(D.loadRandomDirectory,run)
+      if not active or D.randomRun~=run then return end
+      if not ok and os.clock()-run.directoryAt>12 then finishRandom(run,1,err); return end
+    end
+    local candidates=D.fewestRandomCandidates(run.servers,run.excluded,os.clock())
+    if #candidates==0 then finishRandom(run,0.75,'No available random server without known friends'); return end
+    local target=candidates[math.random(1,#candidates)]
+    if not run.prepared then
+      run.prepared=true
+      D.saveGuiBeforeTeleport()
+      if type(D.flushReport)=='function' and (not D.lastSharedReport or os.clock()-D.lastSharedReport>=12) then
+        task.spawn(function() pcall(D.flushReport,2) end)
+      end
+      D.stopFarm()
+    end
+    if not active or D.randomRun~=run then return end
+    run.attempts+=1
+    run.target=target
+    randomJoin.Text='JOINING...'
+    task.delay(0.5,function()
+      if D.randomRun==run and run.target==target then randomJoin.Text='JOIN RANDOM SERVER' end
+    end)
+    rememberRandom(game.JobId)
+    rememberRandom(target)
+    task.delay(5,function()
+      if run.target==target then finishRandom(run,0.75,'Roblox did not complete the teleport') end
+    end)
+    local ok,err=pcall(Teleports.TeleportToPlaceInstance,Teleports,run.directoryPlaceId,target,D.player)
+    if not ok then D.handleRandomFailure(run,target,nil,err) end
+  end
+  D.loadRandomDirectory=function(run)
+    local directory=featureConfig
+    if not directory then error('Server directory is connecting; try again') end
+    local data,err=network(directory.endpoint..'/v1/random-servers','GET',nil,{['X-NYX-Room']=directory.roomKey},false,9,true)
+    if not data then error(err or 'Roblox server list unavailable') end
+    if type(data)~='table' or type(data.data)~='table' then error('Invalid server list') end
+    run.servers=data.data
+    run.directoryPlaceId=tonumber(data.placeId) or 107778070777162
+    run.directoryAt=os.clock()-math.max(0,tonumber(data.ageSeconds) or 0)
+  end
+  D.joinRandomServer=function()
+    if randomBusy or joining or os.clock()<randomRetryAt then return end
+    local run={deadline=os.clock()+18,attempts=0}
+    D.randomRun=run
+    randomBusy=true
+    joining=true
+    randomJoin.Active=false
+    randomJoin.AutoButtonColor=false
+    randomJoin.Text='SEARCHING...'
+    task.delay(18,function() finishRandom(run,0.75,'Random server request timed out') end)
+    task.spawn(function()
+      local ok,err=pcall(function()
+        run.excluded=friendServerExclusions()
+        if not active or D.randomRun~=run then return end
+        D.loadRandomDirectory(run)
+        D.tryRandomTarget(run)
+      end)
+      if not ok and active and D.randomRun==run then finishRandom(run,3,err) end
+    end)
+  end
+  randomJoin.Activated:Connect(D.joinRandomServer)
+  local publicBroadcastConfig=nil
+  local featureSending=false
+  local featureTicket=0
+  local featureAttemptAt=os.clock()-15+Random.new():NextNumber(0,15)
+  local featureAckAt=-math.huge
+  local featureSignature=nil
+  D.featureStatus='Connecting'
+  local function sendFeature(payload,signature)
+    if not featureConfig or featureSending or type(requestFn)~='function' then return end
+    local endpoint,key=featureConfig.endpoint,featureConfig.roomKey
+    featureSending=true;
+    featureTicket+=1;
+    featureAttemptAt=os.clock()
+    local ticket=featureTicket
+    local worker=task.spawn(function()
+      local ok,response=pcall(requestFn,{Url=endpoint..'/v1/report',Method='POST',Timeout=6,
+      Headers={['Content-Type']='application/json',['X-NYX-Room']=key},Body=Http:JSONEncode(payload)})
+      if featureTicket~=ticket then return end
+      featureSending=false
+      local decoded,body=false,nil
+      if ok and type(response)=='table' and tonumber(response.StatusCode or response.Status)==200 then
+        decoded,body=pcall(Http.JSONDecode,Http,response.Body or '')
+      end
+      local acknowledged=decoded and type(body)=='table' and body.ok==true and type(body.accepted)=='number'
+      and not body.staleScan and not body.cycleClosed and not body.metadataRequired
+      and (#payload.eggs==0 or body.accepted>0)
+      if acknowledged then
+        featureAckAt=os.clock();
+        featureSignature=signature
+        D.featureStatus='Sent '..tostring(body.accepted)..'/'..tostring(#payload.eggs)
+      else
+        D.featureStatus='Report retry'
+      end
+      D.gui:SetAttribute('TenshiFeatureReportOK',acknowledged==true)
+    end)
+    task.delay(8,function()
+      if featureTicket==ticket and featureSending then
+        featureTicket+=1;
+        featureSending=false;
+        pcall(task.cancel,worker)
+        D.featureStatus='Report retry'
+        D.gui:SetAttribute('TenshiFeatureReportOK',false)
+      end
+    end)
+  end
+  local function loadConfig()
+    local data,err=network('https://raw.githubusercontent.com/syss1211/Tenshi-script/main/NYX-Contabo-Config.json?nyx='..os.time(),'GET',nil,nil,false,4)
+    if not data then return false,err end
+    if type(data.endpoint)~='string' or not data.endpoint:match('^https://[%w%.%-]+$') or type(data.roomKey)~='string' then
+      return false,'Contabo configuration unavailable'
+    end
+    local trial=data.endpoint..'/finder'
+    local roomKey=data.roomKey
+    featureConfig={endpoint=trial..'/feature',roomKey=roomKey}
+    publicBroadcastConfig={endpoint=trial..'/primary',roomKey=roomKey}
+    config=featureConfig;
+    configAt=os.clock()
+    return true
+  end
+  local broadcastInterval=12
+  local function snapshot()
+    local eggs={}
+    for _,entry in ipairs(D.reportEntries()) do
+      if not entry.unresolved and entry.uid and entry.rate and entry.rate>=MIN_BROADCAST_RATE then
+        eggs[#eggs+1]={uid=tostring(entry.uid),name=entry.name,category=entry.category,rarity=entry.rarity,rank=entry.tier,rate=entry.rate,scale=entry.scale,weight=entry.weight,icon=entry.icon,area=entry.areaKey or entry.area,mutations=entry.mutationText or (entry.traitsKnown==false and 'UNKNOWN' or ''),traitsKnown=entry.traitsKnown~=false,estimated=entry.estimated==true or entry.unmutatedRate~=nil or entry.scaleFromModel==true,visualId=entry.visualId==true,source=entry.isEvent and 'event' or 'field'}
+      end
+    end
+    table.sort(eggs,function(a,b) return a.rate>b.rate end)
+    while #eggs>3 do eggs[#eggs]=nil end
+    return eggs
+  end
+  local function report(timeout)
+    if game.JobId=='' then return false,'No live server ID' end
+    if not D.ready() then return false,'Waiting for a fresh field scan' end
+    if not publicBroadcastConfig then return false,'Public broadcast configuration unavailable' end
+    local eggs=snapshot()
+    local good,metadata=pcall(function() return D.metadata and D.metadata() end)
+    if not good then metadata=nil end
+    local classicEggs=eggs
+    if metadata and type(metadata.states)=='table' then
+      local parsed,filtered=pcall(function()
+        local states={}
+        for _,state in ipairs(metadata.states) do states[state.uid]=state.state end
+        local values={}
+        for _,e in ipairs(eggs) do
+          if states[e.uid]=='Slot' then
+            values[#values+1]=e
+            if #values==3 then break end
+          end
+        end
+        return values
+      end)
+      if parsed then classicEggs=filtered end
+    end
+    local removed={}
+    for _,record in ipairs(metadata and metadata.states or {}) do
+      if record.state=='Claimed' then
+        removed[#removed+1]=record.uid
+        if #removed==256 then break end
+      end
+    end
+    local players=game:GetService('Players')
+    local body={placeId=game.PlaceId,jobId=game.JobId,reporterId=reporterId,eggs=classicEggs,removedUids=removed,
+    playerCount=#players:GetPlayers(),maxPlayers=players.MaxPlayers}
+    if metadata and type(metadata.resetAt)=='number' then
+      if metadata.resetAt-workspace:GetServerTimeNow()*1000<=2000 then return false,'Waiting for reset' end
+      body.resetAt=metadata.resetAt
+    end
+    local data,err=network(publicBroadcastConfig.endpoint..'/v1/report','POST',Http:JSONEncode(body),
+    {['Content-Type']='application/json',['X-NYX-Room']=publicBroadcastConfig.roomKey},false,timeout)
+    if not data or data.ok~=true or type(data.accepted)~='number' then
+       return false,err or 'Public broadcast not acknowledged'
+    end
+    if #classicEggs>0 and data.accepted<=0 then return false,'Public broadcast accepted zero eggs' end
+    if D.gui then
+       pcall(function() D.gui:SetAttribute('TenshiPublicAccepted',data.accepted);
+      D.gui:SetAttribute('TenshiPublicSent',#classicEggs)
+    end)
+    end
+    D.lastSharedReport=os.clock()
+    return true,'Shared '..tostring(data.accepted)..' eggs'
+  end
+  D.flushReport=report
+  task.spawn(function()
+    while active do
+      local ok,err=pcall(function()
+        if not featureConfig or not D.ready() or featureSending or os.clock()-featureAttemptAt<broadcastInterval or game.JobId=='' then return end
+        local metadata=D.metadata()
+        if not metadata or not metadata.resetAt or not metadata.scanAt or not metadata.scanClock then return end
+        local remaining=metadata.resetAt-workspace:GetServerTimeNow()*1000
+        if remaining<=2000 then D.featureStatus='Waiting for reset'; return end
+        local players=game:GetService('Players')
+        local ids={}
+        for _,member in ipairs(players:GetPlayers()) do ids[#ids+1]=member.UserId end
+        local signatureParts={tostring(metadata.resetAt),'players:'..tostring(#ids)}
+        for _,record in ipairs(metadata.states) do
+           signatureParts[#signatureParts+1]=record.uid..':'..tostring(record.state)
+        end
+        table.sort(signatureParts)
+        local signature=table.concat(signatureParts,';')
+        if signature==featureSignature and os.clock()-featureAckAt<broadcastInterval then return end
+        local eggs=snapshot()
+        sendFeature({placeId=game.PlaceId,jobId=game.JobId,reporterId=reporterId,reporterStartedAt=D.reporterStartedAt,eggs=eggs,publicDirect=true,
+        eggStates=metadata.states,resetAt=metadata.resetAt,scanAt=metadata.scanAt,
+        scanAgeMs=math.max(0,(os.clock()-metadata.scanClock)*1000),resetRemainingMs=remaining,
+        userId=D.player.UserId,playerIds=ids,maxPlayers=players.MaxPlayers},signature)
+      end)
+      if not ok then
+         D.featureStatus='Report retry';
+        warn('Jen broadcast: '..tostring(err))
+      end
+      task.wait(1)
+    end
+  end)
+  do
+    local players=game:GetService('Players')
+    local lastFull=#players:GetPlayers()>=players.MaxPlayers
+    local scheduled=false
+    local nextSend=0
+    local function queuePopulation()
+      if scheduled or not active then return end
+      scheduled=true
+      task.delay(math.max(0.20,nextSend-os.clock()),function()
+        scheduled=false
+        if not active or not featureConfig or game.JobId=='' then return end
+        local count=#players:GetPlayers()
+        local capacity=players.MaxPlayers
+        local full=count>=capacity
+        if full==lastFull then return end
+        lastFull=full
+        nextSend=os.clock()+2
+        local body=Http:JSONEncode({placeId=game.PlaceId,jobId=game.JobId,reporterId=reporterId,
+        playerCount=count,maxPlayers=capacity})
+        network(featureConfig.endpoint..'/v1/population','POST',body,
+        {['Content-Type']='application/json',['X-NYX-Room']=featureConfig.roomKey},false,2,true)
+      end)
+    end
+    local added=players.PlayerAdded:Connect(queuePopulation)
+    local removing=players.PlayerRemoving:Connect(queuePopulation)
+    D.gui.Destroying:Connect(function() added:Disconnect(); removing:Disconnect() end)
+  end
+  local function refresh()
+    local directory=featureConfig
+    local fallback=viewerCode=='' and publicBroadcastConfig or nil
+    local epoch=queryEpoch
+    local query='?localJob='..Http:UrlEncode(game.JobId)..'&placeId='..game.PlaceId..'&limit='..(viewerCode~='' and '10&tier=premium' or '30&tier=public')..'&offset=0'..(viewerCode~='' and '&minRate='..tostring(minRate)..'&minRank='..tostring(minRank) or '')
+    local requestedCycle=cycleInfo()
+    if requestedCycle then
+       query=query..'&cycleRemainingMs='..tostring(math.max(0,requestedCycle.remaining*1000))..'&cycleId='..tostring(requestedCycle.resetAt)
+    end
+    if othersOnly and viewerCode~='' then query=query..'&onlyJob='..Http:UrlEncode(game.JobId) end
+    local data,err
+    local usedFallback=false
+    if directory and os.clock()>=(D.featureReadRetryAt or 0) then
+      data,err=network(directory.endpoint..'/v1/eggs'..query,'GET',nil,{['X-NYX-Room']=directory.roomKey,['X-NYX-Viewer']=viewerCode~='' and viewerCode or nil},false,5,true)
+      if fallback and (type(data)~='table' or type(data.items)~='table') then
+        D.featureReadRetryAt=os.clock()+10
+      end
+    end
+    if epoch~=queryEpoch then return true end
+    if fallback and (not directory or fallback.endpoint~=directory.endpoint) and (type(data)~='table' or type(data.items)~='table') then
+      data,err=network(fallback.endpoint..'/v1/eggs'..query,'GET',nil,{['X-NYX-Room']=fallback.roomKey},false,4,true)
+      usedFallback=true
+    end
+    if epoch~=queryEpoch then return true end
+    if type(data)~='table' or type(data.items)~='table' then
+      D.feedReadRetryAt=os.clock()+3
+      if err=='HTTP 401' then
+         viewerCode='';
+         unlock.Text='PREMIUM';
+         feed={};
+         pageOffset=0
+      end
+      return false,err=='HTTP 401' and 'Wrong access code' or err or 'Invalid finder feed'
+    end
+    unlock.Text=data.tier=='premium' and 'PREMIUM ON' or 'PREMIUM'
+    nextOffset=tonumber(data.nextOffset)
+    page.Text=data.tier=='premium' and 'GLOBAL TOP 10' or 'TOP 30'
+    local receivedAt=os.clock()
+    clockOffset=math.max(clockOffset,(tonumber(data.serverTime) or os.time()*1000)/1000-receivedAt)
+    feed={}
+    for _,entry in ipairs(data.items) do
+      local now=(os.clock()+clockOffset)*1000
+      if D.publicEntryAllowed(entry,now) then feed[#feed+1]=entry end
+    end
+    D.gui:SetAttribute('TenshiFeedRoute',usedFallback and 'fallback' or 'primary')
+    local serverNow=(os.clock()+clockOffset)*1000
+    D.hostTaken={}
+    for _,entry in ipairs(feed) do
+      if entry.jobId==game.JobId and type(entry.key)=='string' and entry.takenConfirmed==true then
+         D.hostTaken[entry.key]=entry
+      end
+    end
+    for _,entry in ipairs(data.localStates or {}) do
+      if entry.jobId==game.JobId and type(entry.key)=='string' and entry.takenConfirmed==true and D.publicEntryAllowed(entry,serverNow) then
+         D.hostTaken[entry.key]=entry
+      end
+    end
+    D.feedReporters=tonumber(data.participants) or 0;
+    feedAt=os.clock()
+    D.feedPressureHint=data.refreshSeconds==5
+    D.nearFull=false
+    local limit=tonumber(data.joinerLimit)
+    if not othersOnly and limit and limit>1 then
+      for _,entry in ipairs(feed) do
+        if (tonumber(entry.joinerCount) or 0)>=limit-1 then D.nearFull=true; break end
+      end
+    end
+    queryStatus=data.tier=='premium' and string.format('PREMIUM | %d servers | %d reporters',data.servers or 0,data.participants or 0) or 'Updated'
+    return true
+  end
+  local lastRender
+  local rarityColors={
+    divine=Color3.fromRGB(255,205,55),eternal=Color3.fromRGB(218,202,236),
+    secret=Color3.fromRGB(255,255,255),cosmic=Color3.fromRGB(190,85,255),
+    mythic=Color3.fromRGB(255,75,85),legendary=Color3.fromRGB(255,155,45),
+    epic=Color3.fromRGB(255,110,200),rare=Color3.fromRGB(65,165,255),
+    uncommon=Color3.fromRGB(105,220,120),common=Color3.fromRGB(220,225,235)
+  }
+  local function weightPresentation(entry)
+    local isKg=type(entry.weight)=='number'
+    local value=isKg and entry.weight or entry.scale
+    local neutral=Color3.fromRGB(220,224,235)
+    if type(value)~='number' or value~=value or value<0 or value==math.huge then return '—',neutral end
+    local compact=value>=1000
+    local number
+    if value>=1e15 then number=string.format('%.2g',value)
+    elseif value>=1e12 then number=string.format('%.2f',value/1e12):gsub('0+$',''):gsub('%.$','')..'T'
+    elseif value>=1e9 then number=string.format('%.2f',value/1e9):gsub('0+$',''):gsub('%.$','')..'B'
+    elseif value>=1e6 then number=string.format('%.2f',value/1e6):gsub('0+$',''):gsub('%.$','')..'M'
+    elseif compact then number=string.format('%.2f',value/1000):gsub('0+$',''):gsub('%.$','')..'K'
+    else number=string.format('%.2f',value) end
+    local color=neutral
+    if not isKg and not compact then
+      if value<0.60 then color=Color3.fromRGB(245,85,85)
+      elseif value<0.80 then color=Color3.fromRGB(255,210,75)
+      elseif value>2.50 then color=Color3.fromRGB(100,240,140) end
+    end
+    return (isKg and number..' KG' or '×'..number),color
+  end
+  D.scalePresentation=function(entry)
+    local value=entry.scale
+    local neutral=Color3.fromRGB(220,224,235)
+    if type(value)~='number' or value~=value or value<0 or value==math.huge then return '—',neutral,Color3.new(0,0,0) end
+    local color=neutral
+    if value<0.60 then color=Color3.fromRGB(245,85,85)
+    elseif value<0.80 then color=Color3.fromRGB(255,210,75)
+    elseif value>10 then color=Color3.fromRGB(125,55,190)
+    elseif value>2.50 and value<1000 then color=Color3.fromRGB(45,155,80) end
+    return (value>=1e5 and string.format('x%.2g',value) or string.format('x%.2f',value)),color,Color3.new(0,0,0)
+  end
+  local function mutationNames(entry)
+    if entry.isEvent or entry.source=='event' then return {} end
+    local raw=tostring(entry.mutations or entry.mutationText or ''):gsub('%s*%[[^%]]*%]',''):match('^%s*(.-)%s*$')
+    raw=raw:gsub('^[Mm]utation[sS]?%s*:%s*','')
+    local lower=raw:lower()
+    if entry.traitsKnown==false or lower:find('unknown',1,true) or lower:find('unverified',1,true) then return {'Unknown'} end
+    if raw=='' or lower=='none' or lower=='normal' or lower=='none (explicit data)' then return {} end
+    local result,seen={},{}
+    for token in raw:gmatch('[^,;|+]+') do
+      local name=token:match('^%s*(.-)%s*$')
+      local key=name:lower()
+      if key=='gold' or key=='golden' then name='Golden'; key='golden'
+      elseif key=='silver' then name='Silver'
+      elseif key=='rainbow' then name='Rainbow' end
+      if name~='' and not seen[key] then result[#result+1]=name; seen[key]=true end
+    end
+    local order={golden=1,silver=2,rainbow=3}
+    table.sort(result,function(a,b)
+      local left,right=order[a:lower()] or 4,order[b:lower()] or 4
+      if left~=right then return left<right end
+      return a:lower()<b:lower()
+    end)
+    return result
+  end
+  local mutationSpriteData={}
+  local mutationSprites={}
+  do
+    local asset=getcustomasset or getsynasset
+    if type(asset)=='function' and type(writefile)=='function' then
+      local alphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+      local values={}
+      for i=1,#alphabet do values[alphabet:sub(i,i)]=i-1 end
+      local function decode(value)
+        local out,buffer,bits={},0,0
+        for i=1,#value do
+          local digit=values[value:sub(i,i)]
+          if digit then
+            buffer=buffer*64+digit;
+            bits+=6
+            if bits>=8 then
+              bits-=8;
+              out[#out+1]=string.char(math.floor(buffer/2^bits)%256);
+              buffer=buffer%2^bits
+            end
+          end
+        end
+        return table.concat(out)
+      end
+      D.decodeAsset=decode
+      for key,spec in pairs(mutationSpriteData) do
+        local ok,uri=pcall(function()
+          local filename='jen_minecraft_'..key..'_v1.png'
+          writefile(filename,decode(spec.data))
+          return asset(filename)
+        end)
+        if ok and type(uri)=='string' then
+           mutationSprites[key]={image=uri,width=spec.width,height=spec.height}
+        end
+      end
+    end
+  end
+  local function styleRaisedButton(button)
+    if button:FindFirstChild('StuddedSurface') then return end
+    local corner=button:FindFirstChildOfClass('UICorner')
+    if corner then corner.CornerRadius=UDim.new(0,3) end
+    button.ClipsDescendants=true
+    local spec=mutationSprites.studs_v05
+    local texture=D.make('ImageLabel',{Name='StuddedSurface',Image=spec and spec.image or '',Size=UDim2.fromScale(1,1),BackgroundTransparency=1,
+    ImageTransparency=0.65,ImageColor3=button.BackgroundColor3,ScaleType=Enum.ScaleType.Tile,TileSize=UDim2.fromOffset(256,256),Active=false,ZIndex=button.ZIndex},button)
+    local function tint() texture.ImageColor3=button.BackgroundColor3 end
+    button:GetPropertyChangedSignal('BackgroundColor3'):Connect(tint)
+    D.make('UIStroke',{Color=Color3.fromRGB(5,12,24),Thickness=2,ApplyStrokeMode=Enum.ApplyStrokeMode.Border},button)
+    D.make('UIGradient',{Color=ColorSequence.new(Color3.new(1,1,1),Color3.fromRGB(165,175,195)),Rotation=90},button)
+    D.make('Frame',{Position=UDim2.fromOffset(3,2),Size=UDim2.new(1,-6,0,1),BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=0.55,BorderSizePixel=0,Active=false,ZIndex=button.ZIndex+1},button)
+    D.make('Frame',{Position=UDim2.new(0,3,1,-3),Size=UDim2.new(1,-6,0,1),BackgroundColor3=Color3.new(0,0,0),BackgroundTransparency=0.25,BorderSizePixel=0,Active=false,ZIndex=button.ZIndex+1},button)
+    local caption=D.make('TextLabel',{Name='RaisedCaption',Text=button.Text,RichText=button.RichText,Size=UDim2.fromScale(1,1),BackgroundTransparency=1,
+    TextColor3=button.TextColor3,TextSize=button.TextSize,Font=button.Font,TextScaled=button.TextScaled,TextWrapped=false,
+    TextTransparency=0,TextStrokeColor3=Color3.fromRGB(5,10,20),TextStrokeTransparency=0.35,Active=false,ZIndex=button.ZIndex+2},button)
+    local function sync()
+      local glyph=button:FindFirstChild('CustomButtonFont')
+      caption.Text=button.Text;
+      caption.TextColor3=button.TextColor3
+      caption.TextTransparency=glyph and glyph.ImageTransparency==0 and 1 or 0
+      if button.TextTransparency~=1 then button.TextTransparency=1 end
+    end
+    local glyph=button:FindFirstChild('CustomButtonFont')
+    if glyph then glyph:GetPropertyChangedSignal('ImageTransparency'):Connect(sync) end
+    sync()
+    button:GetPropertyChangedSignal('Text'):Connect(sync)
+    button:GetPropertyChangedSignal('TextTransparency'):Connect(sync)
+    button:GetPropertyChangedSignal('TextColor3'):Connect(sync)
+    for _,child in ipairs(button:GetDescendants()) do
+      if child:IsA('GuiObject') and child~=texture and child~=caption and child.Name~='StuddedSurface' then
+         child.ZIndex=math.max(child.ZIndex,button.ZIndex+3)
+      end
+    end
+  end
+  styleRaisedButton(D.bestLocalCard.status)
+  do
+    local caption=D.bestLocalCard.status:FindFirstChild('RaisedCaption')
+    caption.Position=UDim2.fromOffset(6,2);
+    caption.Size=UDim2.new(1,-12,1,-4)
+    D.make('UITextSizeConstraint',{MinTextSize=1,MaxTextSize=18},caption)
+    D.make('UIStroke',{Color=Color3.new(0,0,0),Thickness=2},caption)
+  end
+  for _,button in ipairs({scope,myScope,rarity,D.sortButton,unlock,refreshButton,randomJoin,sizeMinus,sizePlus}) do
+     styleRaisedButton(button)
+  end
+  for _,button in ipairs({scope,myScope,rarity,D.sortButton,unlock,randomJoin}) do
+    button.Font=Enum.Font.FredokaOne
+    local caption=button:FindFirstChild('RaisedCaption')
+    if caption then
+      caption.Font=Enum.Font.FredokaOne;
+      caption.TextScaled=true;
+      caption.TextSize=20
+      caption.TextStrokeTransparency=1
+      caption.Position=UDim2.fromOffset(6,2);
+      caption.Size=UDim2.new(1,-12,1,-4)
+      D.make('UITextSizeConstraint',{MinTextSize=10,MaxTextSize=(button==unlock) and 22 or 20},caption)
+      D.make('UIStroke',{Color=Color3.new(0,0,0),Thickness=2},caption)
+    end
+  end
+  do
+    local uiAssetUris={}
+    local uiAssetTargets={}
+    local uiAssetsLoading=false
+    loadUiAsset=function(target,key)
+      if uiAssetUris[key] then target.Image=uiAssetUris[key]; return end
+      uiAssetTargets[#uiAssetTargets+1]={object=target,key=key}
+      if uiAssetsLoading then return end
+      uiAssetsLoading=true
+      task.spawn(function()
+        local asset=getcustomasset or getsynasset
+        if type(asset)~='function' or type(writefile)~='function' or type(D.decodeAsset)~='function' then return end
+        local missing={}
+        for _,name in ipairs({'gear','discord'}) do
+          local filename='jen_beta_settings_v1_'..name..'.png'
+          local exists=false
+          if type(isfile)=='function' then pcall(function() exists=isfile(filename) end) end
+          if exists then
+            local ok,uri=pcall(asset,filename)
+            if ok then uiAssetUris[name]=uri end
+          end
+          if not uiAssetUris[name] then missing[#missing+1]=name end
+        end
+        if #missing>0 then
+          local ok,data=pcall(function() return Http:JSONDecode(game:HttpGet('https://raw.githubusercontent.com/syss1211/Tenshi-script/ebde34bfef44bce389f0a6a276455f8019f34051/assets/nyx-settings-art-v1.json')) end)
+          if ok and type(data)=='table' then
+            for _,name in ipairs(missing) do
+              local encoded=data[name]
+              if type(encoded)=='string' then
+                pcall(function()
+                  local bytes=D.decodeAsset(encoded)
+                  if bytes:sub(1,8)~=string.char(137)..'PNG'..string.char(13,10,26,10) then return end
+                  local filename='jen_beta_settings_v1_'..name..'.png'
+                  writefile(filename,bytes);
+                  uiAssetUris[name]=asset(filename)
+                end)
+              end
+            end
+          else
+             warn('Jen UI artwork: unable to load settings icons')
+          end
+        end
+        for _,item in ipairs(uiAssetTargets) do
+          if item.object.Parent and uiAssetUris[item.key] then item.object.Image=uiAssetUris[item.key] end
+        end
+        uiAssetTargets={};
+        uiAssetsLoading=false
+      end)
+    end
+    themeModal=function(box)
+      box.BackgroundColor3=Color3.fromRGB(43,45,50);
+      box.BackgroundTransparency=0.03
+      D.make('UIGradient',{Color=ColorSequence.new(Color3.new(1,1,1),Color3.fromRGB(165,168,178)),Rotation=90},box)
+      D.make('UIStroke',{Color=Color3.fromRGB(100,104,116),Thickness=2,ApplyStrokeMode=Enum.ApplyStrokeMode.Border},box)
+      if mutationSprites.studs_v05 then
+        D.make('ImageLabel',{Name='ModalStuds',Image=mutationSprites.studs_v05.image,Size=UDim2.fromScale(1,1),BackgroundTransparency=1,ScaleType=Enum.ScaleType.Tile,TileSize=UDim2.fromOffset(256,256),ImageColor3=Color3.fromRGB(145,148,158),ImageTransparency=0.7,Active=false,ZIndex=box.ZIndex},box)
+      end
+    end
+    heading.Text='JEN FINDER'
+    heading.AnchorPoint=Vector2.new(0.5,0)
+    heading.Position=UDim2.new(0.5,-10,0,2);
+    heading.Size=UDim2.new(1,-112,0,24)
+    heading.TextXAlignment=Enum.TextXAlignment.Center
+    heading.Font=Enum.Font.Arcade;
+    heading.TextTransparency=0
+    discordSubtitle.AnchorPoint=Vector2.new(0.5,0)
+    discordSubtitle.Position=UDim2.new(0.5,0,0,27);
+    discordSubtitle.Size=UDim2.new(1,-112,0,14)
+    discordSubtitle.TextXAlignment=Enum.TextXAlignment.Center
+    local settingsButton=D.make('TextButton',{Name='OpenSettings',Text='⚙',TextSize=30,Font=Enum.Font.GothamBold,Position=UDim2.fromOffset(6,3),Size=UDim2.fromOffset(40,40),BackgroundTransparency=1,TextColor3=Color3.new(1,1,1),ZIndex=6},panel)
+    local gear=D.make('ImageLabel',{Name='SettingsGear',Image='',Position=UDim2.fromOffset(-1,-1),Size=UDim2.fromOffset(42,42),BackgroundTransparency=1,ScaleType=Enum.ScaleType.Fit,Active=false,ZIndex=7},settingsButton)
+    gear:GetPropertyChangedSignal('IsLoaded'):Connect(function() if gear.IsLoaded and gear.Image~='' then settingsButton.TextTransparency=1 end end)
+    loadUiAsset(gear,'gear')
+    local settingsOverlay=D.make('TextButton',{Name='SettingsOverlay',Text='',Visible=false,Size=UDim2.fromScale(1,1),BackgroundColor3=Color3.new(0,0,0),BackgroundTransparency=0.32,AutoButtonColor=false,Active=true,ZIndex=50},panel)
+    local settingsBox=D.make('Frame',{Name='SettingsBox',AnchorPoint=Vector2.new(0.5,0.5),Position=UDim2.fromScale(0.5,0.5),Size=UDim2.new(1,-28,0,414),BackgroundColor3=Color3.fromRGB(43,45,50),Active=true,ZIndex=51},settingsOverlay)
+    D.make('UICorner',{CornerRadius=UDim.new(0,4)},settingsBox)
+    themeModal(settingsBox)
+    local function settingsLabel(text,y)
+      local label=D.label(settingsBox,text,UDim2.fromOffset(14,y),UDim2.new(1,-28,0,28),Color3.new(1,1,1),20)
+      label.Font=Enum.Font.FredokaOne;
+      label.TextXAlignment=Enum.TextXAlignment.Center;
+      label.TextScaled=true;
+      label.ZIndex=54
+      D.make('UITextSizeConstraint',{MinTextSize=12,MaxTextSize=20},label)
+      return label
+    end
+    settingsLabel('SETTINGS',10)
+    settingsLabel('CUSTOM GUI',59)
+    settingsLabel('CUSTOM HOTKEY MENU',160)
+    sizeMinus.Parent=settingsBox;
+    sizePlus.Parent=settingsBox;
+    sizeLabel.Parent=settingsBox
+    sizeMinus.Position=UDim2.new(0.5,-78,0,94);
+    sizeMinus.Size=UDim2.fromOffset(48,48)
+    sizePlus.Position=UDim2.new(0.5,30,0,94);
+    sizePlus.Size=UDim2.fromOffset(48,48)
+    sizeLabel.Position=UDim2.new(0.5,-28,0,107);
+    sizeLabel.Size=UDim2.fromOffset(56,22)
+    for _,obj in ipairs({sizeMinus,sizePlus,sizeLabel}) do
+      obj.ZIndex=55
+      for _,child in ipairs(obj:GetDescendants()) do
+         if child:IsA('GuiObject') then child.ZIndex=56 end
+      end
+    end
+    local hotkeyButton=D.make('TextButton',{Name='HotkeyBind',Text=menuHotkey.Name,Font=Enum.Font.FredokaOne,Position=UDim2.new(0,14,0,199),Size=UDim2.new(1,-28,0,42),BackgroundColor3=Color3.fromRGB(67,71,82),TextColor3=Color3.new(1,1,1),TextSize=18,ZIndex=55},settingsBox)
+    hotkeyButton.Font=Enum.Font.FredokaOne
+    local waitingForHotkey=false
+    local function stopSettings()
+      waitingForHotkey=false;
+      settingsOverlay.Visible=false;
+      hotkeyButton.Text=menuHotkey.Name
+    end
+    do
+      local visuals=D.baseEggVisuals
+      local function toggle(name,y,value,set,waiting)
+        local button=D.make('TextButton',{Text='',Position=UDim2.fromOffset(14,y),Size=UDim2.new(1,-28,0,38),BackgroundColor3=Color3.fromRGB(65,70,80),TextColor3=Color3.new(1,1,1),TextSize=18,Font=Enum.Font.FredokaOne,ZIndex=55},settingsBox)
+        styleRaisedButton(button)
+        local caption=button:FindFirstChild('RaisedCaption')
+        if caption then
+          caption.Font=Enum.Font.FredokaOne
+          caption.TextScaled=true
+          D.make('UITextSizeConstraint',{MinTextSize=11,MaxTextSize=19},caption)
+          D.make('UIStroke',{Color=Color3.new(0,0,0),Thickness=1.8},caption)
+        end
+        local function paint()
+          local enabled=value()
+          local text=name..': '..(enabled and (waiting and waiting() and 'LOADING...' or 'ON') or 'OFF')
+          local color=enabled and Color3.fromRGB(40,135,70) or Color3.fromRGB(65,70,80)
+          if button.Text~=text then button.Text=text end
+          if button.BackgroundColor3~=color then button.BackgroundColor3=color end
+        end
+        button.Activated:Connect(function() set(not value()); paint() end)
+        paint()
+        return paint
+      end
+      D.paintNightSkyOption=toggle('NIGHT SKY',250,function() return D.nightSky.enabled end,D.setNightSky)
+      D.paintMyEggOption=toggle('HIDE MY EGGS',294,function() return visuals.hideMine end,D.setHideMyEggs,function() return not visuals.renderer end)
+      D.paintBaseEggOption=toggle('HIDE OTHERS EGGS',338,function() return visuals.enabled end,D.setHideBaseEggs,function() return not visuals.renderer end)
+    end
+    local settingsClose=D.make('TextButton',{Name='CloseSettings',Text='×',Position=UDim2.new(1,-46,0,4),Size=UDim2.fromOffset(40,40),BackgroundColor3=Color3.fromRGB(170,45,55),TextColor3=Color3.new(1,1,1),TextSize=24,ZIndex=55},settingsBox)
+    settingsClose.Activated:Connect(stopSettings)
+    settingsOverlay.Activated:Connect(stopSettings)
+    settingsButton.Activated:Connect(function()
+      if settingsOverlay.Visible then stopSettings() else settingsOverlay.Visible=true end
+    end)
+    hotkeyButton.Activated:Connect(function() waitingForHotkey=true; hotkeyButton.Text='PRESS A KEY  (ESC TO CANCEL)' end)
+    local hotkeyConnection=Input.InputBegan:Connect(function(input,processed)
+      if input.UserInputType~=Enum.UserInputType.Keyboard or input.KeyCode==Enum.KeyCode.Unknown then return end
+      if waitingForHotkey then
+        waitingForHotkey=false
+        if input.KeyCode~=Enum.KeyCode.Escape then
+           menuHotkey=input.KeyCode;
+          saveSettings()
+        end
+        hotkeyButton.Text=menuHotkey.Name
+        return
+      end
+      if processed or Input:GetFocusedTextBox() then return end
+      if input.KeyCode==menuHotkey then
+        panel.Visible=not panel.Visible;
+        D.localPanel.Visible=not panel.Visible
+        if not panel.Visible then stopSettings() end
+      end
+    end)
+    D.gui.Destroying:Connect(function() hotkeyConnection:Disconnect() end)
+    do
+      local service=game:GetService('TextService')
+      heading.Font=discordSubtitle.Font
+      local available=(panel.Size.X.Offset>0 and panel.Size.X.Offset or 402)-100
+      local fontSize=22
+      local textWidth
+      repeat
+        textWidth=math.ceil(service:GetTextSize(heading.Text,fontSize,discordSubtitle.Font,Vector2.new(1000,1000)).X)+4
+        if textWidth<=available or fontSize<=14 then break end
+        fontSize-=1
+      until false
+      heading.AnchorPoint=Vector2.new(0.5,0);
+      heading.Position=UDim2.new(0.5,0,0,1);
+      heading.Size=UDim2.fromOffset(textWidth,26)
+      heading.TextSize=fontSize;
+      heading.TextScaled=false;
+      heading.TextXAlignment=Enum.TextXAlignment.Center;
+      heading.TextStrokeTransparency=1
+      local limit=heading:FindFirstChildOfClass('UITextSizeConstraint');
+      if limit then limit.MaxTextSize=22 end
+      D.make('UIStroke',{Color=Color3.new(0,0,0),Thickness=1.4},heading)
+      discordSubtitle.TextSize=14;
+      discordSubtitle.TextScaled=true;
+      discordSubtitle.Size=UDim2.new(1,-108,0,16)
+      discordSubtitle.Position=UDim2.new(0.5,0,0,27);
+      discordSubtitle.TextStrokeTransparency=1
+      local discordLimit=discordSubtitle:FindFirstChildOfClass('UITextSizeConstraint');
+      if discordLimit then discordLimit.MaxTextSize=14 end
+      D.make('UIStroke',{Color=Color3.new(0,0,0),Thickness=1.3},discordSubtitle)
+    end
+    sizeLabel.Font=Enum.Font.FredokaOne;
+    sizeLabel.TextStrokeTransparency=1;
+    sizeLabel.TextSize=20
+    local sizeLimit=sizeLabel:FindFirstChildOfClass('UITextSizeConstraint');
+    if sizeLimit then sizeLimit.MaxTextSize=20 end
+    D.make('UIStroke',{Color=Color3.new(0,0,0),Thickness=1.6},sizeLabel)
+    refreshButton.Font=Enum.Font.FredokaOne
+    local refreshCaption=refreshButton:FindFirstChild('RaisedCaption')
+    if refreshCaption then
+      refreshCaption.Font=Enum.Font.FredokaOne;
+      refreshCaption.TextSize=20;
+      refreshCaption.TextScaled=true;
+      refreshCaption.TextStrokeTransparency=1
+      refreshCaption.Position=UDim2.fromOffset(4,2);
+      refreshCaption.Size=UDim2.new(1,-8,1,-4)
+      D.make('UITextSizeConstraint',{MinTextSize=12,MaxTextSize=20},refreshCaption)
+      D.make('UIStroke',{Color=Color3.new(0,0,0),Thickness=1.7},refreshCaption)
+    end
+    resetTimer.Font=Enum.Font.FredokaOne;
+    resetTimer.TextSize=16;
+    resetTimer.TextScaled=true;
+    resetTimer.TextStrokeTransparency=1
+    D.make('UITextSizeConstraint',{MinTextSize=10,MaxTextSize=16},resetTimer)
+    D.make('UIStroke',{Color=Color3.new(0,0,0),Thickness=1.4},resetTimer)
+    syncCloseArt=function(button)
+      button.BackgroundTransparency=1;
+      button.Font=Enum.Font.FredokaOne;
+      button.TextSize=30
+      button.TextColor3=Color3.fromRGB(245,45,45);
+      button.TextStrokeColor3=Color3.new(0,0,0)
+      local art=D.make('ImageLabel',{Name='SharedClosePNG',Image='',AnchorPoint=Vector2.new(0.5,0.5),Position=UDim2.fromScale(0.5,0.5),Size=UDim2.new(1,-8,1,-8),BackgroundTransparency=1,ScaleType=Enum.ScaleType.Fit,Active=false,ZIndex=button.ZIndex+1},button)
+      local function sync()
+        if not art.Parent then return end
+        local uri=closeArt.Image
+        art.Image=uri
+        local hasImage=type(uri)=='string' and uri~=''
+        button.Text=hasImage and '' or '×'
+        button.TextTransparency=hasImage and 1 or 0
+        button.TextStrokeTransparency=hasImage and 1 or 0
+      end
+      closeArt:GetPropertyChangedSignal('Image'):Connect(sync)
+      sync()
+    end
+    syncCloseArt(settingsClose)
+  end
+  local mutationPalettes={
+    title={Color3.fromRGB(223,221,221),Color3.fromRGB(255,255,255),Color3.fromRGB(214,214,214)},
+    discord={Color3.fromRGB(255,0,225),Color3.fromRGB(161,0,255)},
+    golden={Color3.fromRGB(206,164,0),Color3.fromRGB(255,191,0),Color3.fromRGB(253,227,92)},
+    rainbow={Color3.fromRGB(255,0,0),Color3.fromRGB(255,248,0),Color3.fromRGB(0,255,154)},
+    silver={Color3.fromRGB(71,71,71),Color3.fromRGB(170,170,170),Color3.fromRGB(71,71,71)}
+  }
+  local mutationGradients={golden={},silver={},rainbow={},discord={},title={}}
+  local function mutationSequence(palette,now)
+    local phase=(now/4)%1
+    local points={}
+    for i=0,16 do
+      local sample=((i/16-phase)%1)*#palette
+      local index=math.floor(sample)
+      points[#points+1]=ColorSequenceKeypoint.new(i/16,palette[index+1]:Lerp(palette[(index+1)%#palette+1],sample-index))
+    end
+    return ColorSequence.new(points)
+  end
+  local function mutationStyle(object,name)
+    local key=name:lower()
+    if key=='gold' then key='golden' end
+    local palette=mutationPalettes[key]
+    if not palette then return end
+    if object:IsA('TextLabel') then
+      object.TextColor3=Color3.new(1,1,1);
+      object.TextStrokeTransparency=1
+    else
+       object.ImageColor3=Color3.new(1,1,1)
+    end
+    local gradient=D.make('UIGradient',{Color=mutationSequence(palette,os.clock()),Rotation=0},object)
+    local bucket=mutationGradients[key];
+    bucket[#bucket+1]=gradient
+  end
+  mutationStyle(discordSubtitle,'discord')
+  mutationStyle(heading,'title')
+  local filterPalettes={
+    cosmic={Color3.fromRGB(67,37,239),Color3.fromRGB(113,29,255),Color3.fromRGB(41,12,217)},
+    secret={Color3.fromRGB(40,40,40),Color3.fromRGB(195,195,201)},
+    eternal={Color3.fromRGB(143,203,193),Color3.fromRGB(82,28,125),Color3.fromRGB(212,216,236)}
+  }
+  local filterWords=D.make('Frame',{Name='RarityFontParts',AnchorPoint=Vector2.new(0.5,0.5),Position=UDim2.fromScale(0.5,0.5),Size=UDim2.fromOffset(1,26),BackgroundTransparency=1,Active=false,ZIndex=rarity.ZIndex+5},rarity)
+  local function filterLabel(text)
+    local label=D.make('TextLabel',{Text=text,Font=Enum.Font.FredokaOne,TextSize=20,TextColor3=Color3.new(1,1,1),TextStrokeTransparency=1,BackgroundTransparency=1,TextWrapped=false,TextScaled=false,Active=false,ZIndex=filterWords.ZIndex},filterWords)
+    D.make('UIStroke',{Color=Color3.new(0,0,0),Thickness=2},label)
+    return label
+  end
+  local filterPrefix=filterLabel('MIN RARITY:')
+  local filterWord=filterLabel('Any')
+  local filterGradient=D.make('UIGradient',{Enabled=false,Rotation=0},filterWord)
+  local filterName=rarityOptions[rarityIndex].name:lower()
+  local function updateFilterColor(now)
+    local palette=filterPalettes[filterName]
+    if palette then
+      filterWord.TextColor3=Color3.new(1,1,1);
+      filterGradient.Enabled=true
+      filterGradient.Color=mutationSequence(palette,now)
+    else
+      filterGradient.Enabled=false;
+      filterWord.TextColor3=rarityColors[filterName] or Color3.new(1,1,1)
+    end
+  end
+  local function refreshFilterWord()
+    local name=rarityOptions[rarityIndex].name
+    filterName=name:lower();
+    filterWord.Text=name
+    filterGradient.Rotation=filterName=='eternal' and 90 or 0
+    rarity.TextTransparency=1
+    local caption=rarity:FindFirstChild('RaisedCaption');
+    if caption then caption.Visible=false end
+    local panelWidth=panel.Size.X.Offset>0 and panel.Size.X.Offset or 402
+    local available=math.max(20,panelWidth*rarity.Size.X.Scale+rarity.Size.X.Offset-20)
+    local service=game:GetService('TextService')
+    local size,prefixWidth,wordWidth=22,0,0
+    repeat
+      prefixWidth=math.ceil(service:GetTextSize(filterPrefix.Text,size,Enum.Font.FredokaOne,Vector2.new(1000,1000)).X)+4
+      wordWidth=math.ceil(service:GetTextSize(name,size,Enum.Font.FredokaOne,Vector2.new(1000,1000)).X)+4
+      if prefixWidth+wordWidth+6<=available or size<=10 then break end
+      size-=1
+    until false
+    filterWords.Size=UDim2.fromOffset(prefixWidth+wordWidth+6,26)
+    filterPrefix.Position=UDim2.new();
+    filterPrefix.Size=UDim2.fromOffset(prefixWidth,26);
+    filterPrefix.TextSize=size
+    filterWord.Position=UDim2.fromOffset(prefixWidth+6,0);
+    filterWord.Size=UDim2.fromOffset(wordWidth,26);
+    filterWord.TextSize=size
+    updateFilterColor(os.clock())
+  end
+  rarity:GetPropertyChangedSignal('Text'):Connect(refreshFilterWord)
+  refreshFilterWord()
+  local rarityGradientBuckets={cosmic={},secret={},eternal={}}
+  local function styleRarityLabel(label,key)
+    local palette=filterPalettes[key]
+    if not palette then return end
+    label.TextColor3=Color3.new(1,1,1)
+    if key=='secret' then
+       label.TextStrokeColor3=Color3.new(0,0,0);
+      label.TextStrokeTransparency=0.25
+    end
+    local gradient=D.make('UIGradient',{Color=mutationSequence(palette,os.clock()),Rotation=key=='eternal' and 90 or 0},label)
+    rarityGradientBuckets[key][gradient]=true
+  end
+  local lastMutationUpdate=0
+  local mutationMotion=game:GetService('RunService').Heartbeat:Connect(function()
+    local now=os.clock()
+    if now-lastMutationUpdate<1/20 then return end
+    lastMutationUpdate=now
+    if refreshing then
+      local text='REFRESHING'..string.rep('.',math.floor(now/0.4)%3+1)
+      if refreshButton.Text~=text then refreshButton.Text=text end
+    end
+    if loadingVisible and aliveMessage.Visible then
+      local text=loadingText(now);
+      if aliveMessage.Text~=text then aliveMessage.Text=text end
+    end
+    updateFilterColor(now)
+    for key,bucket in pairs(rarityGradientBuckets) do
+      if next(bucket) then
+        local colors=mutationSequence(filterPalettes[key],now)
+        for gradient in pairs(bucket) do
+          if gradient.Parent then gradient.Color=colors else bucket[gradient]=nil end
+        end
+      end
+    end
+    for key,bucket in pairs(mutationGradients) do
+      if #bucket>0 then
+        local colors=mutationSequence(mutationPalettes[key],now)
+        for i=#bucket,1,-1 do
+          local gradient=bucket[i]
+          if not gradient.Parent then table.remove(bucket,i)
+          else gradient.Color=colors end
+        end
+      end
+    end
+  end)
+  D.gui.Destroying:Connect(function() mutationMotion:Disconnect() end)
+  local function mutationWidth(name,textService,available)
+    local spec=mutationSpriteData[name:lower()]
+    if spec then return math.min(available,math.ceil(spec.width/spec.height*20)+8) end
+    return math.min(available,math.ceil(textService:GetTextSize(name,20,Enum.Font.Arcade,Vector2.new(1000,24)).X)+8)
+  end
+  local function mutationWord(row,name,position,width)
+    local word=D.label(row,name,position,UDim2.fromOffset(width,24),Color3.fromRGB(245,210,125),20)
+    word.Font=Enum.Font.Arcade
+    word.TextXAlignment=Enum.TextXAlignment.Center
+    word.TextYAlignment=Enum.TextYAlignment.Center
+    word.TextTruncate=Enum.TextTruncate.None;
+    word.TextScaled=true;
+    word.TextWrapped=false
+    D.make('UITextSizeConstraint',{MinTextSize=1,MaxTextSize=20},word)
+    mutationStyle(word,name)
+    word.TextStrokeColor3=Color3.new(0,0,0);
+    word.TextStrokeTransparency=0
+    D.make('UIStroke',{Color=Color3.new(0,0,0),Thickness=1.1},word)
+    return word
+  end
+  local ageLabels={}
+  local function resetAgeText(cycle)
+    if not cycle or type(cycle.remaining)~='number' or cycle.remaining~=cycle.remaining then return '--' end
+    local remaining=math.clamp(math.ceil(cycle.remaining),0,300)
+    return tostring(math.floor((300-remaining)/60))..'m ago'
+  end
+  local function resetAgeColor(cycle)
+    local text=resetAgeText(cycle)
+    local minutes=tonumber(text:match('^(%d+)m ago$'))
+    if minutes and minutes>=4 then return Color3.fromRGB(255,85,85) end
+    if minutes and minutes>=2 then return Color3.fromRGB(255,215,65) end
+    return Color3.fromRGB(210,216,230)
+  end
+  local function updateSpawnAges(cycle)
+    local text=resetAgeText(cycle)
+    local color=resetAgeColor(cycle)
+    for _,item in ipairs(ageLabels) do
+      if item.label.Parent then
+        if item.label.Text~=text then item.label.Text=text end
+        if item.label.TextColor3~=color then item.label.TextColor3=color end
+      end
+    end
+  end
+  local joiningKey=nil
+  D.joinAttempt=nil
+  D.joinNotice=function(message)
+    queryStatus=message
+    if not active then return end
+    D.gui:SetAttribute('TenshiLastJoinResult',message)
+    warn('[Jen JOIN] '..tostring(message))
+  end
+  D.finishJoin=function(attempt)
+    if D.joinAttempt~=attempt then return end
+    D.joinAttempt=nil;
+    joining=false;
+    joiningKey=nil;
+    feedAt=-math.huge
+  end
+  local joinRetryAt=0
+  local cardsByKey={}
+  local function compactCardHeight() return 84 end
+  D.fullJobs={}
+  -- FULL is ignored — servers are always joinable now.
+  D.populationFull=function(entry) return false end
+  D.noteFull=function(entry,joinRejected) end
+  D.isFullFailure=function(result,message)
+    if result==Enum.TeleportResult.GameFull then return true end
+    local text=tostring(message or ''):lower()
+    return text:find('server is full',1,true)~=nil or text:find('experience is full',1,true)~=nil or text:find('error code: 772',1,true)~=nil
+  end
+  local function joinPresentation(entry)
+    local here=entry.isLocal or entry.jobId==game.JobId
+    if entry.takenConfirmed then return 'TAKEN',Color3.fromRGB(235,55,65),false end
+    if here then return 'HERE',Color3.fromRGB(86,90,100),false end
+    if entry.unavailable or entry.upstreamMissing then return 'UNAVAILABLE',Color3.fromRGB(86,90,100),false end
+    if joining and joiningKey==entry.key then
+      local attempt=D.joinAttempt
+      if attempt and os.clock()-attempt.startedAt<0.5 then
+        return 'JOINING...',Color3.fromRGB(40,160,85),false
+      end
+    end
+    return 'JOIN',Color3.fromRGB(40,160,85),true
+  end
+  local rankWidthCache={}
+  local raritySizeCache={}
+  local function cardSignature(entry)
+    return Http:JSONEncode({tostring(entry.rarity),tostring(entry.mutations),tostring(entry.mutationText),tostring(entry.traitsKnown),tostring(entry.isEvent),tostring(entry.source)})
+  end
+  local function compactWeightToFit(text,available,size,service)
+    local function fits(value) return service:GetTextSize(value,size,Enum.Font.FredokaOne,Vector2.new(1000,1000)).X<=available end
+    local result=text
+    while not fits(result) do
+      local prefix,whole,fraction,suffix=result:match('^(.-)(%d+)%.(%d+)(.*)$')
+      if not fraction then break end
+      fraction=fraction:sub(1,-2)
+      result=prefix..whole..(#fraction>0 and '.'..fraction or '')..suffix
+    end
+    return result
+  end
+  local function fitFinanceText(card)
+    local rowWidth=panel.Size.X.Offset-28
+    local width=rowWidth-184
+    local service=game:GetService('TextService')
+    local weightSize=type(card.entry.weight)=='number' and 16 or 19
+    local incomeWidth=math.min(width*0.48,service:GetTextSize(card.incomeLabel.Text,22,Enum.Font.FredokaOne,Vector2.new(1000,1000)).X+10)
+    local weightCellWidth=width-incomeWidth
+    local weightAvailable=math.max(1,weightCellWidth-8)
+    card.incomeLabel.Parent.Size=UDim2.new(0,incomeWidth,1,0)
+    card.weightLabel.Parent.Position=UDim2.fromOffset(incomeWidth,0)
+    card.weightLabel.Parent.Size=UDim2.new(0,weightCellWidth,1,0)
+    card.weightLabel.Position=UDim2.fromOffset(3,2)
+    card.weightLabel.Size=UDim2.new(0,weightAvailable,1,-4)
+    card.weightLabel.TextXAlignment=Enum.TextXAlignment.Center
+    card.multiplierLabel.Position=UDim2.fromOffset(3,21)
+    card.multiplierLabel.Size=UDim2.fromOffset(weightAvailable,18)
+    card.multiplierLabel.TextXAlignment=Enum.TextXAlignment.Center
+    card.weightLimit.MaxTextSize=weightSize
+    local text=weightPresentation(card.entry)
+    local preciseWeight=(tonumber(card.entry.rate) or 0)>=1e9
+    if preciseWeight and type(card.entry.weight)=='number' then
+      local value=card.entry.weight
+      if value>=1e12 then text=string.format('%.2fT KG',value/1e12)
+      elseif value>=1e9 then text=string.format('%.2fB KG',value/1e9)
+      elseif value>=1e6 then text=string.format('%.2fM KG',value/1e6)
+      elseif value>=1000 then text=string.format('%.2fK KG',value/1000)
+      else text=string.format('%.2f KG',value) end
+    end
+    card.weightLabel.Text=preciseWeight and text or compactWeightToFit(text,weightAvailable,weightSize,service)
+    for _,spec in ipairs({{card.incomeLabel,incomeWidth-6,22},{card.weightLabel,weightAvailable,weightSize}}) do
+      local label,available,size=spec[1],spec[2],spec[3]
+      local minimum=label==card.weightLabel and 1 or 8
+      while size>minimum and service:GetTextSize(label.Text,size,label.Font,Vector2.new(1000,1000)).X>available do
+         size-=1
+      end
+      label.TextSize=size
+    end
+  end
+  local function updateCard(card,entry,i)
+    if card.multiplierLabel then
+       card.multiplierLabel.Text,card.multiplierLabel.TextColor3,card.multiplierStroke.Color=D.scalePresentation(entry)
+    end
+    local height=84
+    if card.compactHeight~=height or card.renderScale~=responsiveScale.Scale then
+      card.renderScale=responsiveScale.Scale
+      card.compactHeight=height;
+      card.row.Size=UDim2.new(1,-12,0,height)
+      local renderScale=responsiveScale.Scale
+      if type(renderScale)~='number' or renderScale<=0 then renderScale=1 end
+      local iconSize=math.floor(math.min(80,height-18)*renderScale)/renderScale
+      card.icon.Size=UDim2.fromOffset(iconSize,iconSize);
+      card.icon.Position=UDim2.fromOffset(math.floor((4+(78-iconSize)/2)*renderScale)/renderScale,0)
+      card.spotlight.Position=card.icon.Position
+      card.spotlight.Size=card.icon.Size
+      card.join.Position=UDim2.new(1,-98,0,math.min(29,height-54))
+    end
+    local rankText='#'..tostring(entry.displayRank or entry.globalRank or i)
+    if card.rankLabel.Text~=rankText then
+      local width=rankWidthCache[rankText]
+      if not width then
+        width=math.ceil(game:GetService('TextService'):GetTextSize(rankText,20,Enum.Font.FredokaOne,Vector2.new(1000,28)).X)+4
+        rankWidthCache[rankText]=width
+      end
+      card.rankLabel.Text=rankText;
+      card.rankLabel.Size=UDim2.fromOffset(width,28)
+      card.nameLabel.Position=UDim2.fromOffset(86+width,3);
+      card.nameLabel.Size=UDim2.new(1,-94-width,0,26)
+    end
+    if card.nameLabel.Text~=tostring(entry.name) then card.nameLabel.Text=tostring(entry.name) end
+    if card.icon.Image~=(entry.icon or '') then card.icon.Image=entry.icon or '' end
+    if not card.financeReady or card.rate~=entry.rate or card.missingRate~=entry.missingRate then
+      card.incomeLabel.Text=entry.missingRate and 'Income unavailable' or D.money(entry.rate)
+      card.rate=entry.rate;
+      card.missingRate=entry.missingRate
+    end
+    if not card.financeReady or card.scale~=entry.scale or card.weight~=entry.weight then
+      local text,color=weightPresentation(entry)
+      local isScale=type(entry.weight)~='number' and type(entry.scale)=='number'
+      card.weightLabel.Text=text;
+      card.weightLabel.TextColor3=color
+      card.weightLabel.Font=Enum.Font.FredokaOne
+      card.weightLabel.TextSize=isScale and 19 or 16
+      card.weightLimit.MaxTextSize=isScale and 19 or 16
+      card.scale=entry.scale;
+      card.weight=entry.weight
+    end
+    if not card.financeReady or card.fittedRate~=entry.rate or card.fittedWeight~=entry.weight or card.fittedScale~=entry.scale then
+      fitFinanceText(card);
+      card.fittedRate=entry.rate;
+      card.fittedWeight=entry.weight;
+      card.fittedScale=entry.scale
+    end
+    card.financeReady=true
+    local text,color,enabled=joinPresentation(entry)
+    if card.join.Text~=text then card.join.Text=text end
+    if card.buttonText~=text or card.buttonEnabled~=enabled then
+      card.join.BackgroundColor3=color
+      card.join.Active=enabled;
+      card.join.AutoButtonColor=enabled;
+      card.join.Selectable=enabled
+      card.buttonText=text;
+      card.buttonEnabled=enabled
+    end
+  end
+  D.scrollRows={}
+  D.scrollAnchor=function(previous,nextOffsets,y,scale)
+    if y<=0 or #previous==0 then return y end
+    local index=1
+    while index<#previous and previous[index+1].offset*scale<=y do index+=1 end
+    local within=y-previous[index].offset*scale
+    for i=index,#previous do
+      local offset=nextOffsets[previous[i].key]
+      if offset then return offset*scale+within end
+    end
+    for i=index-1,1,-1 do
+      local offset=nextOffsets[previous[i].key]
+      if offset then return offset*scale+within end
+    end
+    return y
+  end
+  local rendering,renderPending,renderQueued=false,false,false
+  local function queueRender()
+    if renderQueued or not active then return end
+    renderQueued=true
+    task.defer(function() renderQueued=false;
+    if active then render() end
+  end)
+  end
+  D.mergeOwnTaken=function(source,now)
+    local takenByKey={}
+    for key,entry in pairs(D.hostTaken or {}) do
+      if D.publicEntryAllowed(entry,now) then
+        local row=table.clone(entry);
+        row.isLocal=true
+        takenByKey[key]=row
+      end
+    end
+    for i=#source,1,-1 do
+       if takenByKey[source[i].key] then table.remove(source,i) end
+    end
+    for _,entry in pairs(takenByKey) do
+      if (entry.rate or 0)>=minRate and (entry.rank or 0)>=minRank then source[#source+1]=entry end
+    end
+  end
+  D.sortDisplayedEggs=function(entries,mode)
+    local function number(value)
+      return type(value)=='number' and value==value and math.abs(value)<math.huge and value or -math.huge
+    end
+    local function price(entry) return entry.missingRate~=true and number(entry.rate) or -math.huge end
+    table.sort(entries,function(a,b)
+      if mode=='Weight' then
+        local left,right=number(a.weight),number(b.weight)
+        if left~=right then return left>right end
+      elseif mode=='Rarity' then
+        local left,right=number(a.rank or a.localTier or a.tier),number(b.rank or b.localTier or b.tier)
+        if left~=right then return left>right end
+      end
+      local left,right=price(a),price(b)
+      if left~=right then return left>right end
+      return tostring(a.key)<tostring(b.key)
+    end)
+    for index,entry in ipairs(entries) do entry.displayRank=index end
+  end
+  D.paintBestLocalCard=function(entry)
+    local card=D.bestLocalCard
+    card.row.Visible=entry~=nil
+    if not entry then return end
+    local taken=entry.takenConfirmed==true
+    card.icon.Image=entry and entry.icon or ''
+    card.name.Text=entry and entry.name or 'MY BEST: —'
+    local rarityKey=entry and entry.rarity:lower():gsub('%s+','') or ''
+    if card.rarityKey~=rarityKey then
+      local previous=card.name:FindFirstChildOfClass('UIGradient')
+      if previous then previous:Destroy() end
+      card.rarityKey=rarityKey
+      card.name.TextStrokeTransparency=1
+      card.name.TextColor3=rarityColors[rarityKey] or Color3.fromRGB(240,240,246)
+      styleRarityLabel(card.name,rarityKey)
+    end
+    card.income.Text=entry and D.money(entry.rate) or ''
+    local weight=entry and weightPresentation(entry) or ''
+    local scale=entry and D.scalePresentation(entry) or ''
+    if scale=='' or scale=='—' then card.size.Text=weight
+    elseif weight=='—' then card.size.Text=scale
+    else card.size.Text=weight..'  '..scale end
+    card.status.Visible=entry~=nil
+    card.status.Text=taken and 'TAKEN' or 'HERE'
+    card.status.BackgroundColor3=taken and Color3.fromRGB(235,55,65) or Color3.fromRGB(86,90,100)
+  end
+  D.updatePreviewBest=function(current,now)
+    local best
+    local function consider(e)
+      if (e.tier or e.rank or 0)>=7 and (e.rate or 0)>0 and (not best or e.rate>best.rate) then best=e end
+    end
+    for _,e in ipairs(current) do consider(e) end
+    for _,e in pairs(D.hostTaken or {}) do
+      if e.jobId==game.JobId and D.publicEntryAllowed(e,now) then consider(e) end
+    end
+    D.paintBestLocalCard(best)
+  end
+  -- Auto-join task: watch the rendered list and join the best matching egg
+  local function autoJoinTick()
+    if not autoJoin.enabled or not active then return end
+    if joining or randomBusy or D.joinAttempt then return end
+    if os.clock()-autoJoin.lastAttempt<autoJoin.cooldown then return end
+    local best
+    for _,entry in ipairs(renderEntries or {}) do
+      if entry.rate and entry.rate>=autoJoin.minRate
+      and (entry.rank or 0)>=autoJoin.minRank
+      and not entry.takenConfirmed
+      and entry.jobId~=game.JobId
+      and not entry.unavailable
+      and D.publicEntryAllowed(entry,(os.clock()+clockOffset)*1000) then
+        if not best or entry.rate>best.rate then best=entry end
+      end
+    end
+    if not best then return end
+    autoJoin.lastAttempt=os.clock()
+    queryStatus='AUTO JOIN -> '..tostring(best.name)
+    -- Trigger the same code as clicking the JOIN card
+    if D.autoJoinEntry then pcall(D.autoJoinEntry,best) end
+  end
+  task.spawn(function()
+    while active do
+      pcall(autoJoinTick)
+      task.wait(1.5)
+    end
+  end)
+  -- Chat command listener: /s
+  local function parseAmount(str)
+    if not str then return nil end
+    local n,suf=tostring(str):lower():match('^(%d+%.?%d*)(%a*)$')
+    if not n then return nil end
+    local mult={['']=1,k=1e3,m=1e6,b=1e9,t=1e12,qa=1e15,qi=1e18}
+    local f=mult[suf]
+    if not f then return nil end
+    return tonumber(n)*f
+  end
+  local function rarityNameToRank(name)
+    if not name then return nil end
+    local map={any=0,cosmic=7,secret=8,eternal=9,divine=10,mythic=6}
+    return map[name:lower()]
+  end
+  local function handleAutoJoinCommand(msg)
+    local sub=msg:sub(3):match('^%s*(.-)%s*$')
+    local cmd,arg1,arg2=sub:match('^(%S*)%s*(%S*)%s*(%S*)$')
+    cmd=(cmd or ''):lower()
+    if cmd=='' then
+       queryStatus=string.format('AUTO JOIN: %s | minRate=%s | minRarity=%s',
+         autoJoin.enabled and 'ON' or 'OFF', money(autoJoin.minRate), autoJoin.minRank)
+    elseif cmd=='on' then
+       autoJoin.enabled=true;
+      saveSettings();
+      queryStatus='AUTO JOIN: ON'
+    elseif cmd=='off' then
+       autoJoin.enabled=false;
+      saveSettings();
+      queryStatus='AUTO JOIN: OFF'
+    elseif cmd=='rate' then
+       local v=parseAmount(arg1)
+      if v then
+         autoJoin.minRate=v; saveSettings();
+        queryStatus='AUTO JOIN rate: '..money(v)
+      else
+         queryStatus='Usage: /s rate 1b'
+      end
+    elseif cmd=='rarity' then
+       local r=rarityNameToRank(arg1)
+      if r then
+         autoJoin.minRank=r; saveSettings();
+        queryStatus='AUTO JOIN rarity: '..arg1:lower()
+      else
+         queryStatus='Usage: /s rarity divine'
+      end
+    elseif cmd=='cooldown' then
+       local v=tonumber(arg1)
+      if v and v>=2 and v<=120 then
+         autoJoin.cooldown=v; saveSettings();
+        queryStatus='AUTO JOIN cooldown: '..v..'s'
+      else
+         queryStatus='Usage: /s cooldown 8'
+      end
+    elseif cmd=='reset' then
+       autoJoin.enabled=false;
+      autoJoin.minRate=0;
+      autoJoin.minRank=0;
+      autoJoin.cooldown=8;
+      saveSettings();
+      queryStatus='AUTO JOIN reset'
+    elseif cmd=='status' then
+       queryStatus=string.format('AUTO JOIN: %s | minRate=%s | minRarity=%d | cooldown=%ds',
+         autoJoin.enabled and 'ON' or 'OFF', money(autoJoin.minRate), autoJoin.minRank, autoJoin.cooldown)
+    else
+       queryStatus='Usage: /s on|off|rate <val>|rarity <name>|cooldown <sec>|status|reset'
+    end
+    if D.gui then D.gui:SetAttribute('JenAutoJoinStatus',queryStatus) end
+  end
+  local renderEntries={}
+  local function bindChatCommand()
+    local chatEvents={}
+    local function hook(re)
+      if not re or not re.OnMessageDoneFiltering then return end
+      chatEvents[#chatEvents+1]=re.OnMessageDoneFiltering:Connect(function(msg)
+        local text=tostring(msg.Message or '')
+        if text:sub(1,2)=='/s' then
+          handleAutoJoinCommand(text)
+          pcall(function() if re == game:GetService('ReplicatedStorage') then return end end)
+          -- Try to suppress in game chat (best-effort, works only if permitted)
+          pcall(function() msg.Message='' end)
+        end
+      end)
+    end
+    pcall(function() hook(game:GetService('ReplicatedStorage'):FindFirstChild('DefaultChatSystemChatEvents')) end)
+    pcall(function() hook(ReplicatedStorage:FindFirstChild('DefaultChatSystemChatEvents')) end)
+    D.gui.Destroying:Connect(function()
+      for _,c in ipairs(chatEvents) do c:Disconnect() end
+    end)
+  end
+  bindChatCommand()
+  local function renderOnce()
+    local passEpoch,passScope=queryEpoch,othersOnly
+    local batchStarted=os.clock()
+    local passDeadline=math.huge
+    local function checkpoint()
+      if os.clock()-batchStarted<0.003 then return true end
+      task.wait()
+      batchStarted=os.clock()
+      if not active then return false end
+      if queryEpoch~=passEpoch or othersOnly~=passScope or (os.clock()+clockOffset)*1000>=passDeadline then
+        renderPending=true
+        return false
+      end
+      return true
+    end
+    local now=(os.clock()+clockOffset)*1000
+    local resetAge=resetAgeText(cycleInfo())
+    local entries={}
+    local source,seen={},{}
+    local metadata=D.metadata and D.metadata()
+    local gameNow=workspace:GetServerTimeNow()*1000
+    local validLocal=not metadata or not metadata.resetAt or metadata.resetAt-2000>gameNow
+    local current=validLocal and D.entries() or {}
+    D.updatePreviewBest(current,now)
+    if othersOnly then
+      local live=D.entries()
+      local localCycle=cycleInfo()
+      for _,e in ipairs(live) do
+        if (e.rate or 0)>=minRate and (e.tier or 0)>=minRank then
+          local uid=tostring(e.uid or e.key)
+          source[#source+1]={key=game.PlaceId..':'..game.JobId..':'..uid,uid=uid,
+          name=e.name,rate=e.rate or 0,missingRate=e.rate==nil,scale=e.scale,weight=e.weight,
+          icon=e.icon,rarity=e.rarity,rank=e.tier,localTier=e.tier,mutations=e.mutationText,
+          traitsKnown=e.traitsKnown~=false,area=e.areaKey or e.area,model=e.model,isLocal=true,
+          source=e.isEvent and 'event' or 'field',estimated=e.estimated or e.unmutatedRate~=nil,
+          placeId=game.PlaceId,jobId=game.JobId,expiresAt=now+5000,seenAt=0,
+          spawnedAt=not e.isEvent and localCycle and localCycle.respawnAt or nil}
+        end
+      end
+    else
+      for _,e in ipairs(feed) do
+        if e.jobId~=game.JobId and (e.cached~=true or e.takenConfirmed==true) and (e.rate or 0)>=minRate and (e.rank or 0)>=minRank and type(e.expiresAt)=='number' and e.expiresAt>now then
+           source[#source+1]=e;
+          seen[e.key]=true
+        end
+      end
+      local localCycle=cycleInfo()
+      for _,e in ipairs(current) do
+        if e.broadcastEligible and (e.rate or 0)>=math.max(minRate,MIN_BROADCAST_RATE) and (e.tier or 0)>=minRank then
+          local key=game.PlaceId..':'..game.JobId..':'..tostring(e.uid or e.key)
+          if not seen[key] then
+            seen[key]=true
+            source[#source+1]={key=key,uid=tostring(e.uid or e.key),name=e.name,rate=e.rate or 0,missingRate=e.rate==nil,scale=e.scale,weight=e.weight,icon=e.icon,rarity=e.rarity,mutations=e.mutationText,traitsKnown=e.traitsKnown~=false,area=e.areaKey or e.area,model=e.model,isLocal=true,localTier=e.tier,full=false,source=e.isEvent and 'event' or 'field',estimated=e.estimated or e.unmutatedRate~=nil,placeId=game.PlaceId,jobId=game.JobId,expiresAt=now+5000,seenAt=0,spawnedAt=not e.isEvent and localCycle and localCycle.respawnAt or nil,spawnTimeKnown=not e.isEvent and localCycle~=nil and type(localCycle.respawnAt)=='number'}
+          end
+        end
+      end
+      D.mergeOwnTaken(source,now)
+    end
+    table.sort(source,function(a,b)
+      if a.rate~=b.rate then return a.rate>b.rate end
+      return a.key<b.key
+    end)
+    local rowLimit=not othersOnly and viewerCode=='' and 30 or 25
+    for _,entry in ipairs(source) do
+      if #entries>=rowLimit then break end
+      local hideHere=not othersOnly and #entries>=14 and not entry.takenConfirmed
+      and (entry.isLocal or entry.jobId==game.JobId)
+      if not hideHere and D.publicEntryAllowed(entry,now) and (othersOnly or not entry.takenConfirmed or #entries<5) then
+        local visible=table.clone(entry)
+        visible.displayRank=#entries+1
+        entries[#entries+1]=visible
+      end
+    end
+    D.sortDisplayedEggs(entries,D.sortOptions[D.sortIndex])
+    renderEntries=entries
+    local canvasHeight=#entries==0 and 40 or 0
+    local nextRows,nextOffsets={},{}
+    ageLabels={}
+    local wanted={}
+    for _,entry in ipairs(entries) do
+       wanted[entry.key]=true;
+      passDeadline=math.min(passDeadline,entry.expiresAt)
+    end
+    for key,card in pairs(cardsByKey) do
+      if not wanted[key] then
+        card.row:Destroy();
+        cardsByKey[key]=nil
+        if not checkpoint() then return end
+      end
+    end
+    loadingVisible=#entries==0 and (othersOnly and type(D.ready)=='function' and not D.ready() or not othersOnly and feedAt<=0)
+    aliveMessage.Visible=#entries==0
+    aliveMessage.Text=loadingVisible and loadingText(os.clock()) or othersOnly and (type(D.ready)=='function' and not D.ready() and 'Reading current server eggs...' or 'No matching eggs in this server') or PREMIUM_EDITION and viewerCode=='' and 'Enter your Premium access code' or 'No matching eggs right now'
+    for i,entry in ipairs(entries) do
+      local signature=cardSignature(entry)
+      local card=cardsByKey[entry.key]
+      if not card or not card.row.Parent or card.signature~=signature then
+        if card and card.row.Parent then card.row:Destroy() end
+        card={entry=entry,signature=signature}
+        local row=D.make('Frame',{Size=UDim2.new(1,-12,0,90),LayoutOrder=i,BackgroundColor3=Color3.fromRGB(105,106,110),BackgroundTransparency=0.36,BorderSizePixel=0},list)
+        card.row=row
+        row.ClipsDescendants=true
+        D.make('UICorner',{CornerRadius=UDim.new(0,1)},row)
+        D.make('UIGradient',{Color=ColorSequence.new(Color3.new(1,1,1),Color3.fromRGB(145,148,155)),Rotation=90},row)
+        D.make('UIStroke',{Color=Color3.fromRGB(20,21,24),Thickness=2,ApplyStrokeMode=Enum.ApplyStrokeMode.Border},row)
+        D.make('Frame',{Name='CardBevelTop',Position=UDim2.fromOffset(2,1),Size=UDim2.new(1,-4,0,1),BackgroundColor3=Color3.fromRGB(190,192,198),BackgroundTransparency=0.3,BorderSizePixel=0,Active=false},row)
+        D.make('Frame',{Name='CardBevelBottom',Position=UDim2.new(0,2,1,-2),Size=UDim2.new(1,-4,0,1),BackgroundColor3=Color3.fromRGB(24,25,28),BorderSizePixel=0,Active=false},row)
+        local spotlight=D.make('Frame',{Name='PetSpotlight',Position=UDim2.fromOffset(2,0),Size=UDim2.new(0,82,1,-22),BackgroundTransparency=1,BorderSizePixel=0,ClipsDescendants=false,Active=false,ZIndex=row.ZIndex+1},row)
+        for n=0,11 do
+          local ray=D.make('Frame',{Name='WhiteRay',AnchorPoint=Vector2.new(0.5,0.5),Position=UDim2.fromScale(0.5,0.5),Size=UDim2.new(0.94,0,0,n%2==0 and 8 or 4),Rotation=n*15+8,BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=0.66,BorderSizePixel=0,Active=false,ZIndex=spotlight.ZIndex},spotlight)
+          D.make('UIGradient',{Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0,1),NumberSequenceKeypoint.new(0.5,0.2),NumberSequenceKeypoint.new(1,1)}),Rotation=0},ray)
+        end
+        for n=1,12 do
+          local glow=D.make('Frame',{Name='SoftCenter',AnchorPoint=Vector2.new(0.5,0.5),Position=UDim2.fromScale(0.5,0.5),Size=UDim2.fromScale(1-n*0.065,1-n*0.065),BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=0.985-n*0.002,BorderSizePixel=0,Active=false,ZIndex=spotlight.ZIndex},spotlight)
+          D.make('UICorner',{CornerRadius=UDim.new(1,0)},glow)
+        end
+        card.spotlight=spotlight
+        card.icon=D.make('ImageLabel',{Name='PetIcon',Image=entry.icon or '',ZIndex=spotlight.ZIndex+1,BackgroundTransparency=1,Size=UDim2.fromOffset(88,88),Position=UDim2.fromOffset(4,4),ScaleType=Enum.ScaleType.Fit},row)
+        local rarityKey=tostring(entry.rarity):lower():gsub('%s+','')
+        local nameColor=rarityColors[rarityKey] or Color3.fromRGB(225,225,235)
+        local rankText='#'..tostring(entry.displayRank or entry.globalRank or i)
+        local textService=game:GetService('TextService')
+        local rankWidth=rankWidthCache[rankText]
+        if not rankWidth then
+          rankWidth=math.ceil(textService:GetTextSize(rankText,20,Enum.Font.FredokaOne,Vector2.new(1000,28)).X)+4
+          rankWidthCache[rankText]=rankWidth
+        end
+        local rankLabel=D.label(row,rankText,UDim2.fromOffset(86,3),UDim2.fromOffset(rankWidth,26),Color3.fromRGB(220,224,235),20)
+        rankLabel.Font=Enum.Font.FredokaOne
+        D.make('UIStroke',{Color=Color3.new(0,0,0),Thickness=1.5},rankLabel)
+        card.rankLabel=rankLabel
+        rankLabel.TextTruncate=Enum.TextTruncate.None
+        local nameLabel=D.label(row,tostring(entry.name),UDim2.fromOffset(86+rankWidth,3),UDim2.new(1,-94-rankWidth,0,26),nameColor,21)
+        card.nameLabel=nameLabel
+        nameLabel.Font=Enum.Font.FredokaOne
+        D.make('UIStroke',{Color=Color3.new(0,0,0),Thickness=1.1},nameLabel)
+        nameLabel.TextStrokeColor3=Color3.new(0,0,0);
+        nameLabel.TextStrokeTransparency=1
+        rankLabel.TextStrokeColor3=Color3.new(0,0,0);
+        rankLabel.TextStrokeTransparency=1
+        pcall(function() card.icon.ResampleMode=Enum.ResamplerMode.Default end)
+        local rarityCell=D.make('Frame',{Name='RarityCell',Position=UDim2.new(0,2,1,-23),Size=UDim2.fromOffset(82,22),BackgroundTransparency=1,ClipsDescendants=true},row)
+        local rarityText=tostring(entry.rarity)
+        local rarityTextSize=raritySizeCache[rarityText]
+        if not rarityTextSize then
+          rarityTextSize=20
+          while rarityTextSize>1 do
+            local bounds=textService:GetTextSize(rarityText,rarityTextSize,Enum.Font.GothamBlack,Vector2.new(1000,1000))
+            if bounds.X<=76 and bounds.Y<=20 then break end
+            rarityTextSize-=1
+          end
+          raritySizeCache[rarityText]=rarityTextSize
+        end
+        local rarityLabel=D.label(rarityCell,rarityText,UDim2.fromOffset(3,1),UDim2.new(1,-6,1,-2),nameColor,rarityTextSize)
+        rarityLabel.Font=Enum.Font.GothamBlack
+        rarityLabel.TextStrokeColor3=Color3.new(0,0,0);
+        rarityLabel.TextStrokeTransparency=0.2
+        rarityLabel.TextXAlignment=Enum.TextXAlignment.Center
+        rarityLabel.TextYAlignment=Enum.TextYAlignment.Center
+        rarityLabel.TextTruncate=Enum.TextTruncate.None
+        rarityLabel.TextScaled=false
+        rarityLabel.TextWrapped=false
+        styleRarityLabel(nameLabel,rarityKey)
+        local finance=D.make('Frame',{Name='IncomeAndWeight',Position=UDim2.fromOffset(82,29),Size=UDim2.new(1,-184,0,22),BackgroundTransparency=1},row)
+        local incomeCell=D.make('Frame',{Name='IncomeCell',Position=UDim2.new(),Size=UDim2.new(0.54,-4,1,0),BackgroundTransparency=1,ClipsDescendants=false},finance)
+        local incomeLabel=D.label(incomeCell,entry.missingRate and 'Income unavailable' or D.money(entry.rate),UDim2.fromOffset(3,2),UDim2.new(1,-6,1,-4),Color3.fromRGB(23,255,0),22)
+        card.incomeLabel=incomeLabel
+        incomeLabel.TextStrokeColor3=Color3.new(0,0,0);
+        incomeLabel.TextStrokeTransparency=1
+        incomeLabel.Font=Enum.Font.FredokaOne
+        D.make('UIStroke',{Color=Color3.new(0,0,0),Thickness=2.2},incomeLabel)
+        incomeLabel.TextTruncate=Enum.TextTruncate.None
+        incomeLabel.TextScaled=false
+        incomeLabel.TextWrapped=false
+        D.make('UITextSizeConstraint',{MinTextSize=1,MaxTextSize=22},incomeLabel)
+        local weightText,weightColor=weightPresentation(entry)
+        local isScale=type(entry.weight)~='number' and type(entry.scale)=='number'
+        local weightCell=D.make('Frame',{Name='WeightCell',Position=UDim2.new(0.54,-10,0,0),Size=UDim2.new(0.46,10,1,0),BackgroundTransparency=1,ClipsDescendants=false},finance)
+        local weightLabel=D.label(weightCell,weightText,UDim2.fromOffset(3,2),UDim2.new(1,-6,1,-4),weightColor,isScale and 19 or 16)
+        card.weightLabel=weightLabel
+        card.multiplierLabel=D.label(weightCell,'',UDim2.new(0.58,1,0,2),UDim2.new(0.42,-3,1,-4),Color3.fromRGB(220,224,235),16)
+        weightLabel.Size=UDim2.new(0.58,-4,1,-4)
+        card.multiplierLabel.Name='EggMultiplier';
+        card.multiplierLabel.Font=Enum.Font.FredokaOne
+        card.multiplierLabel.TextScaled=true;
+        card.multiplierLabel.TextWrapped=false
+        card.multiplierLabel.TextTruncate=Enum.TextTruncate.None
+        card.multiplierLabel.TextStrokeTransparency=1
+        card.multiplierStroke=D.make('UIStroke',{Color=Color3.new(0,0,0),Thickness=1.8},card.multiplierLabel)
+        D.make('UITextSizeConstraint',{MinTextSize=10,MaxTextSize=18},card.multiplierLabel)
+        D.make('UIStroke',{Color=Color3.new(0,0,0),Thickness=1.8},weightLabel)
+        weightLabel.TextStrokeColor3=Color3.new(0,0,0);
+        weightLabel.TextStrokeTransparency=1
+        weightLabel.Font=Enum.Font.FredokaOne
+        weightLabel.TextTruncate=Enum.TextTruncate.None
+        weightLabel.TextScaled=false
+        weightLabel.TextWrapped=false
+        card.weightLimit=D.make('UITextSizeConstraint',{MinTextSize=1,MaxTextSize=isScale and 19 or 16},weightLabel)
+        local ageLabel=D.label(finance,resetAge,UDim2.new(1,-98,1,-23),UDim2.fromOffset(90,22),Color3.fromRGB(210,216,230),17)
+        ageLabel.Font=Enum.Font.FredokaOne
+        ageLabel.TextXAlignment=Enum.TextXAlignment.Center;
+        ageLabel.TextYAlignment=Enum.TextYAlignment.Center
+        ageLabel.TextStrokeColor3=Color3.new(0,0,0);
+        ageLabel.TextStrokeTransparency=1
+        D.make('UIStroke',{Color=Color3.new(0,0,0),Thickness=1.8},ageLabel)
+        ageLabel.Parent=row
+        ageLabel.Name='SpawnAge';
+        ageLabel.TextScaled=true;
+        ageLabel.TextWrapped=false;
+        ageLabel.TextTruncate=Enum.TextTruncate.None
+        D.make('UITextSizeConstraint',{MinTextSize=1,MaxTextSize=17},ageLabel)
+        card.ageLabel=ageLabel
+        rarityLabel.TextColor3=nameLabel.TextColor3
+        local nameGradient=nameLabel:FindFirstChildOfClass('UIGradient')
+        if nameGradient then
+          local gradient=nameGradient:Clone();
+          gradient.Parent=rarityLabel
+          rarityGradientBuckets[rarityKey][gradient]=true
+        end
+        local names=mutationNames(entry)
+        local available=math.max(1,panel.Size.X.Offset-224)
+        local widths,total={},0
+        for i,name in ipairs(names) do
+           widths[i]=mutationWidth(name,textService,available);
+          total+=widths[i]+5
+        end
+        local strip=D.make('Frame',{Name='MutationStrip',Position=UDim2.new(0,86,1,-24),Size=UDim2.new(1,-188,0,24),BackgroundTransparency=1,ClipsDescendants=true},row)
+        local words=D.make('Frame',{Name='MutationWords',AnchorPoint=Vector2.new(0,0.5),Position=UDim2.new(0,4,0.5,0),Size=UDim2.fromOffset(math.max(1,total),24),BackgroundTransparency=1},strip)
+        D.make('UIScale',{Scale=math.min(1,available/math.max(1,total))},words)
+        local x=0
+        for i,name in ipairs(names) do
+           mutationWord(words,name,UDim2.fromOffset(x,0),widths[i]);
+          x+=widths[i]+5
+        end
+        row.Size=UDim2.new(1,-12,0,compactCardHeight())
+        local here=entry.isLocal or entry.jobId==game.JobId
+        local join=D.make('TextButton',{Text=select(1,joinPresentation(entry)),Position=UDim2.new(1,-98,0,29),Size=UDim2.fromOffset(90,32),BackgroundColor3=here and Color3.fromRGB(86,90,100) or Color3.fromRGB(40,160,85),TextColor3=Color3.new(1,1,1),TextSize=13},row)
+        card.join=join
+        local joinCorner=join:FindFirstChildOfClass('UICorner')
+        if joinCorner then joinCorner.CornerRadius=UDim.new(0,3) end
+        join.Font=Enum.Font.FredokaOne
+        styleRaisedButton(join)
+        local caption=join:FindFirstChild('RaisedCaption')
+        if caption then
+          caption.Font=Enum.Font.FredokaOne;
+          caption.TextScaled=true;
+          caption.TextSize=20
+          caption.TextStrokeTransparency=1
+          caption.Position=UDim2.fromOffset(5,2);
+          caption.Size=UDim2.new(1,-10,1,-4)
+          D.make('UITextSizeConstraint',{MinTextSize=10,MaxTextSize=20},caption)
+          D.make('UIStroke',{Color=Color3.new(0,0,0),Thickness=2},caption)
+        end
+        join.Active=not (entry.unavailable)
+        join.AutoButtonColor=not (entry.unavailable)
+        join.Selectable=not (entry.unavailable)
+        local function attemptJoin(clickedEntry)
+          if not clickedEntry then clickedEntry=card.entry end
+          local e=clickedEntry
+          if not D.publicEntryAllowed(e,(os.clock()+clockOffset)*1000) or e.takenConfirmed or e.unavailable or e.upstreamMissing or randomBusy or os.clock()<joinRetryAt or e.jobId==game.JobId then
+            return
+          end
+          if (os.clock()+clockOffset)*1000>=e.expiresAt then
+            queryStatus='Report expired; refreshing';
+            feedAt=0;
+            return
+          end
+          joining=true;
+          joiningKey=e.key;
+          joinRetryAt=os.clock()+0.5
+          local attempt={startedAt=os.clock(),replacedPending=D.joinAttempt~=nil,id=Http:GenerateGUID(false),jobId=e.jobId,uid=e.uid,placeId=e.placeId,entry=e}
+          D.joinAttempt=attempt
+          task.delay(14,function()
+            if not active or D.joinAttempt~=attempt then return end
+            D.testReloadQueued=false
+            D.finishJoin(attempt)
+            queueRender()
+            D.joinNotice(attempt.teleportStarted and 'Roblox teleport timed out. Try again.' or 'Join request timed out. Try again.')
+          end)
+          queryStatus='Joining '..e.name
+          updateCard(card,e,card.row.LayoutOrder or 1)
+          task.delay(0.5,queueRender)
+          e=card.entry
+          if not active or D.joinAttempt~=attempt then return end
+          if not D.publicEntryAllowed(e,(os.clock()+clockOffset)*1000) or e.takenConfirmed or e.unavailable or e.upstreamMissing then
+            D.finishJoin(attempt);
+            updateCard(card,e,card.row.LayoutOrder or 1);
+            return
+          end
+          if (os.clock()+clockOffset)*1000>=e.expiresAt then
+            D.finishJoin(attempt);
+            feedAt=-math.huge;
+            render();
+            return
+          end
+          local directory=featureConfig
+          if directory then
+            local payload={placeId=e.placeId,jobId=e.jobId,uid=e.uid,reporterId=reporterId,userId=D.player.UserId}
+            local result=network(directory.endpoint..'/v1/join','POST',Http:JSONEncode(payload),
+            {['Content-Type']='application/json',['X-NYX-Room']=directory.roomKey},false,2,true)
+            if not active or D.joinAttempt~=attempt then return end
+            if not result or result.allowed~=true then
+              if result and result.full and not result.unavailable then
+                e.full=true
+                D.noteFull(e,result.capacityFull~=true)
+              end
+              feedAt=-math.huge
+              D.finishJoin(attempt);
+              queueRender();
+              return
+            end
+          end
+          D.saveGuiBeforeTeleport()
+          D.stopFarm()
+          attempt.teleportStarted=true;
+          attempt.failureDeadline=os.clock()+30
+          D.lastTeleportAttempt=attempt
+          if not active or D.joinAttempt~=attempt then return end
+          print('[Jen JOIN] Requesting Roblox teleport')
+          local ok,err=pcall(function() Teleports:TeleportToPlaceInstance(e.placeId,e.jobId,D.player) end)
+          if not ok and D.joinAttempt==attempt then
+            D.lastTeleportAttempt=nil
+            D.testReloadQueued=false
+            if D.isFullFailure(nil,err) then
+               D.noteFull(e);
+              queueRender()
+            end
+            D.finishJoin(attempt);
+            D.joinNotice('Roblox: '..tostring(err));
+            queueRender()
+          end
+        end
+        join.Activated:Connect(function() attemptJoin(card.entry) end)
+        D.autoJoinEntry=attemptJoin
+      end
+      card.entry=entry
+      updateCard(card,entry,i)
+      card.row.LayoutOrder=i
+      cardsByKey[entry.key]=card
+      ageLabels[#ageLabels+1]={label=card.ageLabel,entry=entry}
+      nextRows[i]={key=entry.key,offset=canvasHeight}
+      nextOffsets[entry.key]=canvasHeight
+      canvasHeight+=card.row.Size.Y.Offset+4
+      if not checkpoint() then return end
+    end
+    if queryEpoch~=passEpoch or othersOnly~=passScope then
+       renderPending=true;
+      return
+    end
+    local position=list.CanvasPosition
+    local oldHeight=list.CanvasSize.Y.Offset
+    local scale=oldHeight>0 and list.AbsoluteCanvasSize.Y/oldHeight or responsiveScale.Scale
+    if scale<=0 then scale=1 end
+    local target=D.scrollAnchor(D.scrollRows,nextOffsets,position.Y,scale)
+    D.scrollRows=nextRows
+    list.CanvasSize=UDim2.fromOffset(0,canvasHeight)
+    target=math.clamp(target,0,math.max(0,canvasHeight*scale-list.AbsoluteWindowSize.Y))
+    if math.abs(list.CanvasPosition.Y-target)>0.5 then
+      list.CanvasPosition=Vector2.new(position.X,target)
+    end
+    list.Visible=true
+  end
+  local render
+  render=function()
+    if not active then return end
+    if rendering then
+       renderPending=true;
+      return
+    end
+    rendering=true
+    local ok,err=pcall(renderOnce)
+    rendering=false
+    if renderPending then
+       renderPending=false;
+      queueRender()
+    end
+    if not ok then
+       list.Visible=true;
+      error(err)
+    end
+  end
+  requestScopeRender=function()
+    list.Visible=false
+    D.scrollRows={}
+    list.CanvasPosition=Vector2.new(0,0)
+    queueRender()
+  end
+  refreshButton.Activated:Connect(function()
+    if refreshing or not active then return end
+    refreshing=true;
+    refreshButton.Text='REFRESHING.'
+    task.spawn(function()
+      local ok,err=pcall(function()
+        local deadline=os.clock()+12
+        while active and networkBusy and os.clock()<deadline do task.wait(0.1) end
+        if not active then return end
+        if networkBusy then error('Network busy; try again') end
+        if not othersOnly then
+          local loaded,message=refresh();
+          if not loaded then error(message) end
+        end
+        lastRender=nil;
+        render()
+      end)
+      refreshing=false
+      if active then
+        refreshButton.Text='REFRESH'
+        queryStatus=ok and 'List refreshed' or ('Refresh failed: '..tostring(err))
+      end
+    end)
+  end)
+  do
+    local Tweens=game:GetService('TweenService')
+    local states={}
+    local function attachButtonMotion(button)
+      if not (button:IsA('TextButton') or button:IsA('ImageButton')) then return end
+      if button.Name=='SettingsOverlay' or button.Name=='LauncherHitArea' or button:GetAttribute('JenButtonMotion') then return end
+      button:SetAttribute('JenButtonMotion',true)
+      local motion=D.make('UIScale',{Name='ButtonMotion',Scale=1},button)
+      local state={button=button,motion=motion,base=button.Position,hover=false,input=nil,tween=nil,writing=false,alive=true}
+      states[button]=state
+      local function enabled() return button.Active~=false and button.Selectable~=false end
+      local function center()
+        if not state.alive or not button.Parent then return end
+        local delta=motion.Scale-1
+        local x,y=0.5-button.AnchorPoint.X,0.5-button.AnchorPoint.Y
+        local size=button.Size
+        local goal=UDim2.new(state.base.X.Scale-size.X.Scale*delta*x,state.base.X.Offset-size.X.Offset*delta*x,state.base.Y.Scale-size.Y.Scale*delta*y,state.base.Y.Offset-size.Y.Offset*delta*y)
+        state.lastPosition=goal
+        if button.Position==goal then return end
+        state.writing=true
+        button.Position=goal
+        state.writing=false
+      end
+      local function update()
+        if not state.alive then return end
+        if state.tween then
+           state.tween:Cancel();
+          state.tween=nil
+        end
+        local target=1
+        if enabled() then
+          if state.input then target=0.95
+          elseif state.hover then
+            local width=math.max(1,button.AbsoluteSize.X/math.max(0.01,motion.Scale))
+            target=math.min(1.06,1+5/width)
+          end
+        else
+           state.input=nil;
+          state.hover=false
+        end
+        state.tween=Tweens:Create(motion,TweenInfo.new(state.input and 0.08 or 0.13,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),{Scale=target})
+        state.tween:Play()
+      end
+      state.update=update
+      motion:GetPropertyChangedSignal('Scale'):Connect(center)
+      button:GetPropertyChangedSignal('Position'):Connect(function()
+        if not state.writing and button.Position~=state.lastPosition then
+           state.base=button.Position;
+          center()
+        end
+      end)
+      button:GetPropertyChangedSignal('Size'):Connect(center)
+      button:GetPropertyChangedSignal('AnchorPoint'):Connect(center)
+      button:GetPropertyChangedSignal('Active'):Connect(update)
+      button:GetPropertyChangedSignal('Selectable'):Connect(update)
+      button.MouseEnter:Connect(function()
+        if Input:GetLastInputType()==Enum.UserInputType.Touch then return end
+        state.hover=true;
+        update()
+      end)
+      button.MouseLeave:Connect(function() state.hover=false; update() end)
+      button.SelectionGained:Connect(function() state.hover=true; update() end)
+      button.SelectionLost:Connect(function() state.hover=false; update() end)
+      button.InputBegan:Connect(function(input)
+        if not enabled() then return end
+        if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then
+          if input.UserInputType==Enum.UserInputType.Touch then state.hover=false end
+          state.input=input;
+          update()
+        end
+      end)
+      button.Destroying:Connect(function()
+        state.alive=false
+        if state.tween then state.tween:Cancel() end
+        states[button]=nil
+      end)
+    end
+    local release=Input.InputEnded:Connect(function(input)
+      for _,state in pairs(states) do
+        if state.input and (state.input==input or state.input.UserInputType==Enum.UserInputType.MouseButton1 and input.UserInputType==Enum.UserInputType.MouseButton1) then
+          state.input=nil;
+          state.update()
+        end
+      end
+    end)
+    for _,button in ipairs(panel:GetDescendants()) do attachButtonMotion(button) end
+    local added=panel.DescendantAdded:Connect(function(button)
+      if button:IsA('TextButton') or button:IsA('ImageButton') then
+        task.defer(function() if active and button.Parent then attachButtonMotion(button) end end)
+      end
+    end)
+    local hidden=panel:GetPropertyChangedSignal('Visible'):Connect(function()
+      if panel.Visible then return end
+      for _,state in pairs(states) do
+         state.input=nil;
+        state.hover=false;
+        state.update()
+      end
+    end)
+    D.gui.Destroying:Connect(function()
+      release:Disconnect();
+      added:Disconnect();
+      hidden:Disconnect()
+      for _,state in pairs(states) do
+        state.alive=false;
+        if state.tween then state.tween:Cancel() end
+      end
+      table.clear(states)
+    end)
+  end
+  do
+    local Tweens=game:GetService('TweenService')
+    local hovered,moving,scheduled=false,false,false
+    local lastMovement=0
+    local tween
+    local function paint()
+      if tween then tween:Cancel() end
+      local highlighted=hovered or moving
+      tween=Tweens:Create(list,TweenInfo.new(0.14,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),{
+        ScrollBarThickness=highlighted and 9 or 6,
+        ScrollBarImageColor3=highlighted and Color3.fromRGB(200,205,220) or Color3.fromRGB(137,140,150),
+        ScrollBarImageTransparency=highlighted and 0 or 0.18
+      })
+      tween:Play()
+    end
+    local function idle()
+      if not active or not list.Parent then scheduled=false; return end
+      if os.clock()-lastMovement<0.22 then task.delay(0.12,idle); return end
+      scheduled=false;
+      moving=false;
+      paint()
+    end
+    local enter=list.MouseEnter:Connect(function()
+      if Input:GetLastInputType()==Enum.UserInputType.Touch then return end
+      hovered=true;
+      paint()
+    end)
+    local leave=list.MouseLeave:Connect(function() hovered=false; paint() end)
+    local scrolled=list:GetPropertyChangedSignal('CanvasPosition'):Connect(function()
+      lastMovement=os.clock()
+      if not moving then moving=true; paint() end
+      if not scheduled then
+         scheduled=true;
+        task.delay(0.24,idle)
+      end
+    end)
+    local hidden=panel:GetPropertyChangedSignal('Visible'):Connect(function()
+      if not panel.Visible then
+         hovered=false;
+        moving=false;
+        paint()
+      end
+    end)
+    D.gui.Destroying:Connect(function()
+      enter:Disconnect();
+      leave:Disconnect();
+      scrolled:Disconnect();
+      hidden:Disconnect()
+      if tween then tween:Cancel() end
+    end)
+    paint()
+  end
+  fitFinder()
+  panel.Visible=true
+  local failed=Teleports.TeleportInitFailed:Connect(function(who,result,message,_,options)
+    if who==D.player then
+      local instance=options and options.ServerInstanceId
+      local run=D.randomRun
+      if run and run.target and (not instance or instance=='' or instance==run.target) then
+        D.handleRandomFailure(run,run.target,result,message)
+        return
+      end
+      local attempt=D.lastTeleportAttempt
+      if not randomBusy then D.testReloadQueued=false end
+      if attempt and os.clock()<attempt.failureDeadline and (instance==attempt.jobId or (not instance or instance=='') and not randomBusy and not attempt.replacedPending) then
+        D.lastTeleportAttempt=nil
+        if D.isFullFailure(result,message) then D.noteFull(attempt.entry) end
+        D.finishJoin(attempt);
+        queueRender()
+        D.joinNotice('Roblox: '..tostring(message))
+      elseif not attempt and not randomBusy then
+         joining=false
+      end
+      queryStatus='Join failed: '..tostring(message)
+    end
+  end)
+  D.gui.Destroying:Connect(function() active=false;
+   failed:Disconnect();
+  if localHighlight then localHighlight:Destroy() end
+  end)
+  function D.feedRefreshInterval(now)
+    return viewerCode=='' and now<(D.feedPressureUntil or 0) and 5 or 3
+  end
+  function D.recordFeedRead(started,finished,loaded,jitter)
+    if viewerCode~='' then return end
+    if not loaded or D.feedPressureHint or finished-started>=0.8 then
+      D.feedPressureUntil=finished+20+5*jitter
+    end
+    if not loaded then
+      D.feedReadRetryAt=math.max(D.feedReadRetryAt or 0,finished+5+jitter)
+    end
+  end
+  task.spawn(function()
+    local random=Random.new()
+    task.wait(random:NextNumber(0,5))
+    while active do
+      local started=os.clock()
+      if (featureConfig or publicBroadcastConfig and viewerCode=='') and not refreshing and
+      (not PREMIUM_EDITION or viewerCode~='') and started-feedAt>=D.feedRefreshInterval(started) and started>=(D.feedReadRetryAt or 0) then
+        local ok,loaded,message=pcall(refresh)
+        D.recordFeedRead(started,os.clock(),ok and loaded==true,random:NextNumber())
+        if not ok or not loaded then
+          queryStatus='Finder: '..tostring(ok and message or loaded)
+          D.gui:SetAttribute('TenshiFeedStatus',queryStatus)
+        else
+          D.gui:SetAttribute('TenshiFeedStatus','Updated')
+        end
+      end
+      task.wait(0.25)
+    end
+  end)
+  task.spawn(function()
+    local lastReport=os.clock()-broadcastInterval+Random.new():NextNumber(0,broadcastInterval)
+    while active do
+      local ok,err=pcall(function()
+        if networkBusy then return end
+        if (not publicBroadcastConfig or os.clock()-configAt>60) and os.clock()>=(D.primaryConfigRetry or 0) then
+          D.primaryConfigRetry=os.clock()+5;
+          loadConfig()
+        end
+        if publicBroadcastConfig and os.clock()>=(D.primaryReportRetry or 0) and os.clock()-lastReport>=broadcastInterval then
+          D.primaryReportRetry=os.clock()+3
+          local success,message=report(3)
+          if success then lastReport=os.clock() end
+          reportStatus=message
+          if not success then warn('Jen broadcast: '..tostring(message)) end
+        end
+      end)
+      if not ok then
+         reportStatus='BCAST: '..tostring(err);
+        queryStatus=tostring(err);
+        warn('Jen broadcast: '..tostring(err))
+      end
+      task.wait(1)
+    end
+  end)
+  task.spawn(function()
+    while active do
+      status.Text=PREMIUM_EDITION and (tostring(reportStatus)..'\n'..tostring(queryStatus)) or (joining and 'Joining server…' or tostring(reportStatus))
+      local cycle=cycleInfo()
+      if cycle then
+        local seconds=math.max(0,math.ceil(cycle.remaining))
+        resetTimer.Text=cycle.running and string.format('RESET %02d:%02d',math.floor(seconds/60),seconds%60) or 'RESET PAUSED'
+        resetTimer.TextColor3=cycle.running and seconds<=60 and Color3.fromRGB(255,85,85) or cycle.running and seconds<=150 and Color3.fromRGB(255,215,65) or Color3.fromRGB(230,245,255)
+      else
+        resetTimer.Text='RESET --:--'
+        resetTimer.TextColor3=Color3.fromRGB(230,245,255)
+      end
+      sharingNotice.Visible=false
+      local ok=pcall(render)
+      if not ok then queryStatus='Unable to display finder feed' end
+      updateSpawnAges(cycle)
+      task.wait(1)
+    end
+  end)
+end
+local function run()
+  local EggState=module('Client.EggState')
+  local Assets=module('Data.Assets')
+  local States=module('Shared.Types.AreaEggs').States
+  local mutations,eggRecords
+  pcall(function() mutations=module('Shared.Modules.Mutations') end)
+  pcall(function() eggRecords=module('Shared.Util.EggRecords') end)
+  assert(type(EggState.ReadFieldEggs)=='function','ReadFieldEggs unavailable')
+  assert(type(Assets.Directory)=='table' and States and States.Slot~=nil,'Game schema changed')
+  local latestEntries={}
+  local latestMetadata=nil
+  local scanCycle
+  pcall(function() scanCycle=module('Shared.Util.AreaEggCycle') end)
+  local function parseValue(text)
+    local amount,suffix=tostring(text):gsub(',',''):match('^%s*%$?%s*(%d+%.?%d*)%s*(%a*)%s*$')
+    local powers={['']=1,k=1e3,m=1e6,b=1e9,t=1e12,qa=1e15,qi=1e18}
+    local factor=suffix and powers[suffix:lower()]
+    if not amount or not factor then return nil end
+    local value=tonumber(amount)*factor
+    return valid(value) and value or nil
+  end
+  local function newCycleSlots()
+    local cycle,slots,count=nil,{},0
+    local seenCycle,previousCycle={},{}
+    return function(entries,states,resetAt)
+      if resetAt and resetAt~=cycle then
+        if cycle then previousCycle,seenCycle=seenCycle,{} end
+        cycle,slots,count=resetAt,{},0
+      end
+      local ranked,byUid,stateByUid={},{},{}
+      for _,state in ipairs(states) do
+         stateByUid[state.uid]=state.state;
+        seenCycle[state.uid]=true
+      end
+      for _,entry in ipairs(entries) do
+        local uid=tostring(entry.uid)
+        byUid[uid]=entry
+        if entry.rate and entry.rate>=MIN_BROADCAST_RATE and stateByUid[uid]=='Slot' and not previousCycle[uid] then
+           ranked[#ranked+1]=entry
+        end
+      end
+      table.sort(ranked,function(a,b)
+        if a.rate~=b.rate then return a.rate>b.rate end
+        return tostring(a.uid)<tostring(b.uid)
+      end)
+      for _,entry in ipairs(ranked) do
+        if count==4 then break end
+        local uid=tostring(entry.uid)
+        if not slots[uid] then
+           slots[uid]={entry=entry,missing=0};
+          count+=1
+        end
+      end
+      local reports,tracked,taken={},{},{}
+      for uid,slot in pairs(slots) do
+        local state=stateByUid[uid]
+        if state=='Claimed' then slot.taken=true
+        elseif state then slot.missing=0
+        else
+          slot.missing+=1;
+          if slot.missing>=2 then slot.taken=true end
+        end
+        if byUid[uid] and byUid[uid].rate and not slot.taken then slot.entry=byUid[uid] end
+        if slot.taken then
+          tracked[#tracked+1]={uid=uid,state='Claimed'}
+          taken[#taken+1]=slot.entry
+        elseif state then
+          tracked[#tracked+1]={uid=uid,state=state}
+          if byUid[uid] then reports[#reports+1]=byUid[uid] end
+        else
+          tracked[#tracked+1]={uid=uid,state='Unknown'}
+        end
+      end
+      return reports,tracked,taken
+    end
+  end
+  local selectCycleSlots=newCycleSlots()
+  local reportEntries,takenEntries={},{}
+  local lastScan=0
+  createFinder({gui=gui,localPanel={Visible=false},player=player,make=make,label=label,
+    entries=function() return os.clock()-lastScan<10 and latestEntries or {} end,
+    metadata=function() return latestMetadata end,
+    reportEntries=function() return reportEntries end,
+    takenEntries=function() return takenEntries end,
+    ready=function() return lastScan>0 and os.clock()-lastScan<10 end,
+    parseValue=parseValue,money=money,stopFarm=function() end
+  })
+  while alive do
+    local ok,err=pcall(function()
+      local scanStartedClock=os.clock()
+      local snapshot=EggState.ReadFieldEggs()
+      assert(type(snapshot)=='table' and type(snapshot.Records)=='table','Field snapshot unavailable')
+      local eggs={}
+      local fieldStates={}
+      local allStates={}
+      local scanAt=workspace:GetServerTimeNow()*1000
+      local resetAt
+      if scanCycle then
+         pcall(function() if scanCycle.IsRunning() then
+           resetAt=scanCycle.NextResetTime(scanAt/1000)*1000
+        end
+      end)
+      end
+      for recordKey,record in pairs(snapshot.Records) do
+        local stateUid=tostring(record.Uid or recordKey)
+        allStates[stateUid]=record.State
+        local area=tostring(record.AreaId):lower():gsub("[^%a]", "")
+        local broadcastEligible=area~="forest" and area~="lake" and area~="desert" and area~="volcano" and area~="volcanox"
+        local asset=Assets.Directory[record.AssetCategory]
+        if excludedFinderEgg(record.AssetCategory) or excludedFinderEgg(asset and asset.DisplayName) then
+           continue
+        end
+        local rarity=asset and asset.Rarity
+        if not rarity or not finderRarityRank(rarity.DisplayName or rarity._id) then
+           continue
+        end
+        fieldStates[#fieldStates+1]={uid=tostring(record.Uid or recordKey),state=record.State}
+        if record.State==States.Slot or record.State==States.Carried or record.State==States.Dropped or record.State==States.GuardCarried then
+          local uid=record.Uid or recordKey
+          local model=modelFor(uid)
+          local scale=numberField(record,{'AssetScale'})
+          local weight
+          if eggRecords and type(eggRecords.WeightKg)=='function' then
+            local good,result=pcall(eggRecords.WeightKg,record)
+            if good and valid(result) then weight=result end
+          end
+          local rate=displayedRate(model)
+          local estimated=false
+          if not rate then
+            rate=computedRate(asset.EarningRate,scale,record.Mutations or {},mutations)
+            estimated=rate~=nil
+          end
+          local traits,traitsKnown=readTraitNames(record)
+          table.insert(eggs,{key='field:'..tostring(uid),uid=uid,broadcastEligible=broadcastEligible,traitsKnown=traitsKnown,category=record.AssetCategory,areaKey=record.AreaId,worldPos=typeof(record.BottomCFrame)=='CFrame' and record.BottomCFrame.Position or nil,area=tostring(record.AreaId)..' | Mut: '..(#traits>0 and table.concat(traits,', ') or traitsKnown and 'None' or 'UNKNOWN'),model=model,icon=asset.Icon,name=asset.DisplayName or record.AssetCategory or 'Unknown',rarity=rarity.DisplayName or rarity._id or 'Unknown',tier=finderRarityRank(rarity.DisplayName or rarity._id),color=typeof(rarity.Color)=='Color3' and rarity.Color or Color3.new(1,1,1),scale=scale,weight=weight,rate=rate,estimated=estimated})
+        end
+      end
+      for _,entry in ipairs(eggs) do
+        entry.mutationText=tostring(entry.area or ''):match('Mut:%s*(.*)') or ''
+      end
+      local broadcastEggs={}
+      for _,egg in ipairs(eggs) do
+        if egg.broadcastEligible then broadcastEggs[#broadcastEggs+1]=egg end
+      end
+      reportEntries,fieldStates,takenEntries=selectCycleSlots(broadcastEggs,fieldStates,resetAt)
+      for _,record in ipairs(fieldStates) do allStates[record.uid]=record.state end
+      local completeStates={}
+      for uid,state in pairs(allStates) do
+         completeStates[#completeStates+1]={uid=uid,state=state}
+      end
+      latestEntries=eggs
+      latestMetadata={states=completeStates,resetAt=resetAt,scanAt=scanAt,scanClock=scanStartedClock}
+      lastScan=os.clock()
+    end)
+    if not ok then warn('Jen Finder scan:',err) end
+    task.wait(2)
+  end
+end
+task.spawn(function()
+  local ok,err=pcall(run)
+  if not ok then warn('Jen Finder startup:',err) end
+end)
